@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  # 1. Database Container
+  db:
+    image: postgres:15
+    restart: always
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=librarypass
+      - POSTGRES_DB=library_db
+    ports:
+      - "5432:5432"
+
+  # 2. Hybrid App Container
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+    environment:
+      - DATABASE_URL=postgresql://admin:librarypass@db:5432/library_db
+
+  # 3. pgAdmin Container (Database GUI)
+  pgadmin:
+    image: dpage/pgadmin4
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - db
+
+volumes:
+  postgres_data:

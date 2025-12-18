@@ -1,0 +1,992 @@
+from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks # <--- 1. Add BackgroundTasks
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+import requests
+import os
+from typing import Union
+
+
+from contextlib import asynccontextmanager # Add this
+from scheduler import scheduler            # Add this
+# Import our local modules
+from database import engine, Base, get_db
+import models
+import schemas
+from passlib.context import CryptContext
+from datetime import timedelta, date, datetime
+import recommendation
+
+from fastapi.security import OAuth2PasswordBearer
+from jose import jwt, JWTError
+    
+from fastapi.security import OAuth2PasswordRequestForm
+
+LOAN_PERIOD_DAYS = 14
+MAX_RENEWALS = 2
+DAILY_FINE_AMOUNT = 1.0    
+
+MAX_LOANS_PER_MEMBER = 5
+MAX_FINE_THRESHOLD = 10.0 # If user owes > $10, block borrowing
+HOLD_EXPIRY_DAYS = 3      # Reservations expire after 3 days
+
+# Create Tables
+Base.metadata.create_all(bind=engine)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- Startup ---
+    print("🚀 System Starting... Initializing Scheduler...")
+    scheduler.start()
+    yield
+    # --- Shutdown ---
+    print("🛑 System Shutting Down... Stopping Scheduler...")
+    scheduler.shutdown()
+
+app = FastAPI(lifespan=lifespan)
+# CORS (Allowed for development)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+    
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Configuration
+SECRET_KEY = "supersecretkey" # In production, use os.getenv("SECRET_KEY")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+  
+# --- Auth Helpers ---
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    """
+    Decodes the token, extracts user ID/Role, and verifies they exist.
+    """
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        role: str = payload.get("role")
+        if email is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    # Check DB based on role
+    if role == "Librarian" or role == "Admin":
+        user = db.query(models.Librarian).filter(models.Librarian.email == email).first()
+    else:
+        user = db.query(models.Member).filter(models.Member.email == email).first()
+        
+    if user is None:
+        raise credentials_exception
+        
+    return user
+  
+# --- Google Books Helper Function ---
+def fetch_google_book(query: str):
+    """Searches Google Books API and returns the first result formatted as a dict"""
+    api_url = f"https://www.googleapis.com/books/v1/volumes?q={query}"
+    response = requests.get(api_url)
+    data = response.json()
+
+    if "items" not in data:
+        return None
+
+    # Get first result
+    info = data["items"][0]["volumeInfo"]
+    
+    return {
+        "title": info.get("title"),
+        "author": ", ".join(info.get("authors", ["Unknown"])),
+        "isbn": next((id['identifier'] for id in info.get("industryIdentifiers", []) if id['type'] == 'ISBN_13'), None),
+        "publisher": info.get("publisher"),
+        "publication_year": info.get("publishedDate", "")[:4] if info.get("publishedDate") else None,
+        "description": info.get("description"),
+        "cover_image_url": info.get("imageLinks", {}).get("thumbnail"),
+        "genre": info.get("categories", ["General"])[0]
+    }
+
+
+# --- API Routes ---
+
+@app.get("/api/health")
+def health_check():
+    return {"status": "ok", "message": "Library System is running"}
+
+@app.get("/api/books", response_model=list[schemas.BookResponse])
+def get_books(
+    search: str = "", 
+    author: str = "", 
+    genre: str = "",
+    db: Session = Depends(get_db)
+):
+    """BIM-006: Advanced Search"""
+    query = db.query(models.Book)
+    
+    if search:
+        query = query.filter(models.Book.title.ilike(f"%{search}%"))
+    if author:
+        query = query.filter(models.Book.author.ilike(f"%{author}%"))
+    if genre:
+        query = query.filter(models.Book.genre.ilike(f"%{genre}%"))
+        
+    books = query.all()
+    
+    # Calculate available copies
+    for book in books:
+        book.available_copies = len([item for item in book.items if item.status == 'Available'])
+    
+    return books
+
+# 2. Add Book (Manual)
+@app.post("/api/books", response_model=schemas.BookResponse)
+def create_book(book: schemas.BookCreate, db: Session = Depends(get_db)):
+    # Check if ISBN exists to avoid duplicates
+    if book.isbn:
+        existing = db.query(models.Book).filter(models.Book.isbn == book.isbn).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Book with this ISBN already exists")
+            
+    db_book = models.Book(**book.dict())
+    db.add(db_book)
+    db.commit()
+    db.refresh(db_book)
+    return db_book
+
+# 3. Import Book from Google (The "Magic" Button)
+@app.post("/api/books/import", response_model=schemas.BookResponse)
+def import_book(request: schemas.GoogleImportRequest, db: Session = Depends(get_db)):
+    # 1. Fetch from Google
+    book_data = fetch_google_book(request.query)
+    if not book_data:
+        raise HTTPException(status_code=404, detail="Book not found on Google Books")
+
+    # 2. Check if already exists (by ISBN)
+    if book_data.get("isbn"):
+        existing = db.query(models.Book).filter(models.Book.isbn == book_data["isbn"]).first()
+        if existing:
+            return existing # Return existing if found
+
+    # 3. Save to DB
+    db_book = models.Book(**book_data)
+    db.add(db_book)
+    db.commit()
+    db.refresh(db_book)
+    return db_book
+
+# 4. Add Physical Copy (Item)
+@app.post("/api/books/{book_id}/items", response_model=schemas.BookItemResponse)
+def add_book_item(book_id: int, item: schemas.BookItemCreate, db: Session = Depends(get_db)):
+    # Check if book exists
+    book = db.query(models.Book).filter(models.Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book ID not found")
+        
+    # Check if barcode already exists
+    if db.query(models.BookItem).filter(models.BookItem.barcode == item.barcode).first():
+        raise HTTPException(status_code=400, detail="Barcode already exists")
+
+    db_item = models.BookItem(**item.dict(), book_id=book_id)
+    db.add(db_item)
+    db.commit()
+    db.refresh(db_item)
+    return db_item
+
+
+# --- Member Management Endpoints ---
+
+@app.post("/api/members", response_model=schemas.MemberResponse)
+def register_member(member: schemas.MemberCreate, db: Session = Depends(get_db)):
+    # 1. Check if email exists
+    if db.query(models.Member).filter(models.Member.email == member.email).first():
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    # 2. Hash Password
+    hashed_pw = pwd_context.hash(member.password)
+    
+    # 3. Create Member
+    db_member = models.Member(
+        email=member.email,
+        hashed_password=hashed_pw,
+        full_name=member.full_name,
+        phone_number=member.phone_number,
+        address=member.address
+    )
+    db.add(db_member)
+    db.commit()
+    db.refresh(db_member)
+    return db_member
+
+@app.get("/api/members/search", response_model=list[schemas.MemberResponse])
+def search_members(
+    q: str, 
+    current_user: models.Librarian = Depends(get_current_user), # RBAC: Librarians only
+    db: Session = Depends(get_db)
+):
+    """MEM-005: Search Members by Name, Email, or Phone"""
+    # ilike is case-insensitive
+    members = db.query(models.Member).filter(
+        (models.Member.full_name.ilike(f"%{q}%")) |
+        (models.Member.email.ilike(f"%{q}%")) |
+        (models.Member.phone_number.ilike(f"%{q}%"))
+    ).all()
+    return members
+
+@app.get("/api/members/{member_id}", response_model=schemas.MemberResponse)
+def get_member(member_id: int, db: Session = Depends(get_db)):
+    member = db.query(models.Member).filter(models.Member.id == member_id).first()
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+    return member
+
+# --- Circulation Endpoints (The Core Logic) ---
+
+@app.post("/api/loans/issue", response_model=schemas.LoanResponse)
+def issue_book(request: schemas.LoanIssueRequest, db: Session = Depends(get_db)):
+    # 1. Validate Member
+    member = db.query(models.Member).filter(models.Member.id == request.member_id).first()
+    if not member or member.status != "Active":
+        raise HTTPException(status_code=400, detail="Member not found or not active")
+
+    # 2. Check Loan Limits
+    active_loans = db.query(models.Loan).filter(
+        models.Loan.member_id == member.id,
+        models.Loan.status == "Active"
+    ).all()
+    
+    if len(active_loans) >= MAX_LOANS_PER_MEMBER:
+        raise HTTPException(status_code=400, detail=f"Member has reached maximum loan limit ({MAX_LOANS_PER_MEMBER})")
+
+    # --- NEW: Dynamic Fine Calculation ---
+    # Part A: Unpaid fines already in the database
+    unpaid_fines = db.query(models.Fine).filter(
+        models.Fine.member_id == member.id,
+        models.Fine.status.in_(["Unpaid", "Partial"])
+    ).all()
+    recorded_debt = sum(f.amount - f.amount_paid for f in unpaid_fines)
+
+    # Part B: Accrued fines (Books currently overdue but not returned)
+    accrued_debt = 0.0
+    today = date.today()
+    for loan in active_loans:
+        if loan.due_date < today:
+            overdue_days = (today - loan.due_date).days
+            accrued_debt += (overdue_days * DAILY_FINE_AMOUNT)
+
+    total_debt = recorded_debt + accrued_debt
+
+    if total_debt >= MAX_FINE_THRESHOLD:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Blocked: Total debt is ${total_debt} (Recorded: ${recorded_debt}, Accruing: ${accrued_debt}). Limit is ${MAX_FINE_THRESHOLD}."
+        )
+    # -------------------------------------
+
+    # 3. Validate Book Item
+    item = db.query(models.BookItem).filter(models.BookItem.barcode == request.book_item_barcode).first()
+    
+    if not item:
+        raise HTTPException(status_code=404, detail="Book item not found")
+
+    # SPECIAL CHECK: If item is Reserved, only the Reserver can borrow it
+    if item.status == "Reserved":
+        # Find the active reservation for this book title
+        reservation = db.query(models.Reservation).filter(
+            models.Reservation.book_id == item.book_id,
+            models.Reservation.member_id == request.member_id,
+            models.Reservation.status == "Fulfilled"
+        ).first()
+        
+        if not reservation:
+            raise HTTPException(status_code=400, detail="Item is Reserved for another member.")
+        
+        # If match, Close the reservation
+        reservation.status = "Completed"
+    
+    elif item.status != "Available":
+        raise HTTPException(status_code=400, detail=f"Item is currently {item.status}")
+
+    # 4. Create Loan
+    due_date = date.today() + timedelta(days=request.days)
+    new_loan = models.Loan(
+        book_item_id=item.barcode,
+        member_id=member.id,
+        due_date=due_date,
+        status="Active"
+    )
+    item.status = "Borrowed"
+    db.add(new_loan)
+    db.commit()
+    db.refresh(new_loan)
+    return new_loan
+
+# --- Reservation Endpoints ---
+
+@app.post("/api/reservations", response_model=schemas.ReservationResponse)
+def reserve_book(request: schemas.ReservationCreate, db: Session = Depends(get_db)):
+    """
+    RES-001: Process Book Reservation
+    Logic:
+    1. Check if Book exists.
+    2. Check if copies are available. 
+       - If YES: Suggest borrowing instead (Return 400).
+       - If NO: Create Reservation (Waitlist).
+    """
+    # 1. Check Book
+    book = db.query(models.Book).filter(models.Book.id == request.book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    # 2. Check Availability
+    # Count items that are 'Available'
+    available_count = db.query(models.BookItem).filter(
+        models.BookItem.book_id == request.book_id,
+        models.BookItem.status == "Available"
+    ).count()
+
+    if available_count > 0:
+        raise HTTPException(
+            status_code=400, 
+            detail="Book is currently available. You can borrow it directly without reservation."
+        )
+
+    # 3. Create Reservation
+    reservation = models.Reservation(
+        book_id=request.book_id,
+        member_id=request.member_id,
+        status="Pending"
+    )
+    db.add(reservation)
+    db.commit()
+    db.refresh(reservation)
+    return reservation
+
+@app.post("/api/reservations/{reservation_id}/cancel")
+def cancel_reservation(reservation_id: int, db: Session = Depends(get_db)):
+    """RES-002: Cancel Reservation"""
+    reservation = db.query(models.Reservation).filter(models.Reservation.id == reservation_id).first()
+    if not reservation:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+    
+    if reservation.status != "Pending":
+         raise HTTPException(status_code=400, detail="Cannot cancel a completed or already canceled reservation")
+
+    reservation.status = "Canceled"
+    db.commit()
+    return {"message": "Reservation canceled successfully"}
+
+
+# --- Fine Management Endpoints ---
+# NEW:
+@app.get("/api/my/fines", response_model=list[schemas.FineResponse])
+def get_my_fines(
+    current_user: models.Member = Depends(get_current_user), # <--- Security Dependency
+    db: Session = Depends(get_db)
+):
+    # We use current_user.id instead of a URL parameter
+    fines = db.query(models.Fine).filter(
+        models.Fine.member_id == current_user.id,
+        models.Fine.status == "Unpaid"
+    ).all()
+    return fines
+
+@app.post("/api/fines/{fine_id}/pay")
+def pay_fine(fine_id: int, payment: schemas.FinePaymentRequest, db: Session = Depends(get_db)):
+    """CIRC-004: Partial or Full Fine Payment"""
+    fine = db.query(models.Fine).filter(models.Fine.id == fine_id).first()
+    if not fine:
+        raise HTTPException(status_code=404, detail="Fine not found")
+    
+    remaining_balance = fine.amount - fine.amount_paid
+    
+    if fine.status == "Paid" or remaining_balance <= 0:
+        raise HTTPException(status_code=400, detail="Fine is already paid")
+
+    if payment.amount <= 0:
+        raise HTTPException(status_code=400, detail="Payment amount must be positive")
+        
+    if payment.amount > remaining_balance:
+        raise HTTPException(status_code=400, detail=f"Payment exceeds balance. Remaining: ${remaining_balance}")
+
+    # Process Payment
+    fine.amount_paid += payment.amount
+    
+    # Update Status
+    if fine.amount_paid >= fine.amount:
+        fine.status = "Paid"
+    else:
+        fine.status = "Partial"
+
+    db.commit()
+    return {"message": "Payment recorded", "remaining_balance": fine.amount - fine.amount_paid, "status": fine.status}
+
+@app.get("/api/recommendations", response_model=list[schemas.BookResponse])
+def get_recommendations(member_id: int, db: Session = Depends(get_db)):
+    """
+    PORT-005: View Recommendations
+    Uses ML to find books based on borrowing history.
+    """
+    # 1. Run the ML Engine
+    try:
+        book_ids = recommendation.recommend_books(db, member_id)
+    except Exception as e:
+        print(f"ML Error: {e}")
+        book_ids = []
+
+    if not book_ids:
+        return []
+
+    # 2. Fetch Book Objects from DB
+    books = db.query(models.Book).filter(models.Book.id.in_(book_ids)).all()
+
+    # --- FIX: Calculate Available Copies ---
+    for book in books:
+        book.available_copies = len([item for item in book.items if item.status == 'Available'])
+    # ---------------------------------------
+
+    return books
+
+
+def cleanup_old_views(db: Session):
+    """
+    Deletes BookView records older than 24 hours.
+    This runs in the background to avoid slowing down the API.
+    """
+    cutoff_time = datetime.utcnow() - timedelta(days=1)
+    
+    # SQL: DELETE FROM book_views WHERE view_date < cutoff_time
+    deleted_count = db.query(models.BookView).filter(
+        models.BookView.view_date < cutoff_time
+    ).delete(synchronize_session=False)
+    
+    db.commit()
+    if deleted_count > 0:
+        print(f"Cleaned up {deleted_count} old book views.")
+        
+
+@app.post("/api/books/{book_id}/view")
+def log_book_view(
+    book_id: int, 
+    member_id: int, 
+    background_tasks: BackgroundTasks, # <--- Inject BackgroundTasks
+    db: Session = Depends(get_db)
+):
+    """
+    Log view & Trigger Cleanup.
+    """
+    # 1. Verify book exists
+    book = db.query(models.Book).filter(models.Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    # 2. Record New View
+    view = models.BookView(member_id=member_id, book_id=book_id)
+    db.add(view)
+    db.commit()
+    
+    # 3. Schedule Cleanup (Runs after response is sent)
+    background_tasks.add_task(cleanup_old_views, db)
+
+    return {"message": "View logged"}
+
+@app.post("/api/auth/login", response_model=schemas.Token)
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    # 1. Check Librarian Table first
+    # Note: OAuth2 form sends 'username', we treat it as email
+    librarian = db.query(models.Librarian).filter(models.Librarian.email == form_data.username).first()
+    if librarian and pwd_context.verify(form_data.password, librarian.hashed_password):
+        token = create_access_token(data={"sub": librarian.email, "role": librarian.role, "id": librarian.id})
+        return {"access_token": token, "token_type": "bearer", "role": librarian.role, "user_id": librarian.id}
+
+    # 2. Check Member Table
+    member = db.query(models.Member).filter(models.Member.email == form_data.username).first()
+    if member and pwd_context.verify(form_data.password, member.hashed_password):
+        token = create_access_token(data={"sub": member.email, "role": "Member", "id": member.id})
+        return {"access_token": token, "token_type": "bearer", "role": "Member", "user_id": member.id}
+        
+    raise HTTPException(status_code=400, detail="Incorrect email or password")
+
+@app.get("/api/my/loans", response_model=schemas.LoanHistoryResponse)
+def get_my_loan_history(
+    current_user: models.Member = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """PORT-001: View Borrowed Books & Loan History"""
+    active = db.query(models.Loan).filter(
+        models.Loan.member_id == current_user.id,
+        models.Loan.status == "Active"
+    ).all()
+    
+    past = db.query(models.Loan).filter(
+        models.Loan.member_id == current_user.id,
+        models.Loan.status == "Returned"
+    ).all()
+    
+    return {"active_loans": active, "past_loans": past}
+
+@app.put("/api/my/profile", response_model=schemas.MemberResponse)
+def update_my_profile(
+    profile_data: schemas.ProfileUpdate,
+    current_user: models.Member = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """PORT-003: Update Personal Information"""
+    if profile_data.full_name:
+        current_user.full_name = profile_data.full_name
+    if profile_data.phone_number:
+        current_user.phone_number = profile_data.phone_number
+    if profile_data.address:
+        current_user.address = profile_data.address
+    
+    db.commit()
+    db.refresh(current_user)
+    return current_user
+
+@app.post("/api/my/password")
+def change_my_password(
+    pass_data: schemas.PasswordChange,
+    # Allow both user types
+    current_user: Union[models.Member, models.Librarian] = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """PORT-004: Change Password (Works for Members AND Librarians)"""
+    # 1. Verify Old Password
+    if not pwd_context.verify(pass_data.old_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Incorrect current password")
+    
+    # 2. Update to New Password
+    current_user.hashed_password = pwd_context.hash(pass_data.new_password)
+    db.commit()
+    
+    return {"message": "Password updated successfully"}
+
+@app.post("/api/loans/{loan_id}/renew")
+def renew_book(
+    loan_id: int,
+    current_user: models.Member = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    PORT-006: Renew Book Loan
+    Logic:
+    1. Check ownership & status.
+    2. Check Renewal Limit (Max 2).
+    3. Check Reservations.
+    4. Extend Date & Increment Count.
+    """
+    loan = db.query(models.Loan).filter(models.Loan.id == loan_id).first()
+    
+    # 1. Basic Validation
+    if not loan:
+        raise HTTPException(status_code=404, detail="Loan not found")
+    if loan.member_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if loan.status != "Active":
+        raise HTTPException(status_code=400, detail="Cannot renew inactive loan")
+
+    # 2. Check Renewal Limit (New Rule)
+    if loan.renewal_count >= 2:
+        raise HTTPException(
+            status_code=400, 
+            detail="Maximum renewal limit (2) reached for this loan."
+        )
+
+    # 3. Check for Reservations (No Camping Rule)
+    book_id = loan.book_item.book_id
+    pending_reservations = db.query(models.Reservation).filter(
+        models.Reservation.book_id == book_id,
+        models.Reservation.status == "Pending"
+    ).count()
+
+    if pending_reservations > 0:
+        raise HTTPException(
+            status_code=400, 
+            detail="Cannot renew: This book is reserved by another member."
+        )
+
+    # 4. Success: Extend Date & Increment Count
+    loan.due_date = loan.due_date + timedelta(days=14)
+    loan.renewal_count += 1
+    db.commit()
+    
+    return {
+        "message": "Loan renewed successfully", 
+        "new_due_date": loan.due_date,
+        "renewal_count": loan.renewal_count
+    }
+
+@app.get("/api/my/profile", response_model=schemas.MemberResponse)
+def get_my_profile(current_user: models.Member = Depends(get_current_user)):
+    """Get current logged-in member details"""
+    # Calculate fines dynamically for the response
+    unpaid = [f for f in current_user.fines if f.status != "Paid"]
+    current_user.total_fines_due = sum(f.amount - f.amount_paid for f in unpaid)
+    return current_user
+
+@app.post("/api/loans/return", response_model=schemas.LoanResponse)
+def return_book(request: schemas.LoanReturnRequest, db: Session = Depends(get_db)):
+    # 1. Find Active Loan
+    loan = db.query(models.Loan).filter(
+        models.Loan.book_item_id == request.book_item_barcode,
+        models.Loan.status == "Active"
+    ).first()
+
+    if not loan:
+        raise HTTPException(status_code=404, detail="No active loan found for this barcode")
+
+    # 2. Update Loan (Close it)
+    loan.return_date = date.today()
+    loan.status = "Returned"
+
+    # 3. Update Item Status
+    item = db.query(models.BookItem).filter(models.BookItem.barcode == request.book_item_barcode).first()
+    
+    if request.condition == "Damaged":
+        # Handle Damage (CIRC-002)
+        item.status = "Damaged"
+    else:
+        # Normal Return: Check Reservations
+        next_reservation = db.query(models.Reservation).filter(
+            models.Reservation.book_id == item.book_id,
+            models.Reservation.status == "Pending"
+        ).order_by(models.Reservation.reservation_date.asc()).first()
+
+        if next_reservation:
+            # FULFILL RESERVATION
+            item.status = "Reserved"
+            next_reservation.status = "Fulfilled"
+            
+            # --- NOTIFICATION LOGIC (Restored) ---
+            msg = f"Good news! The book '{item.book.title}' is now available for pickup."
+            notification = models.Notification(member_id=next_reservation.member_id, message=msg)
+            db.add(notification)
+            # -------------------------------------
+            
+            print(f"⚠️ Book reserved for Member ID {next_reservation.member_id}")
+        else:
+            item.status = "Available"
+
+    # 4. Check Overdue (Fine Logic)
+    if loan.return_date > loan.due_date:
+        overdue_days = (loan.return_date - loan.due_date).days
+        fine_amount = overdue_days * DAILY_FINE_AMOUNT
+        fine = models.Fine(
+            loan_id=loan.id, 
+            member_id=loan.member_id, 
+            amount=fine_amount, 
+            reason=f"Overdue by {overdue_days} days"
+        )
+        db.add(fine)
+
+    db.commit()
+    db.refresh(loan)
+    return loan
+
+@app.get("/api/reports/overdue", response_model=list[schemas.OverdueReportItem])
+def get_overdue_report(
+    current_user: models.Librarian = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """ADMIN-001: Generate Report (Overdue Items)"""
+    today = date.today()
+    overdue_loans = db.query(models.Loan).filter(
+        models.Loan.status == "Active",
+        models.Loan.due_date < today
+    ).all()
+    
+    report = []
+    for loan in overdue_loans:
+        # Get book title via BookItem -> Book
+        title = loan.book_item.book.title if loan.book_item and loan.book_item.book else "Unknown"
+        days_over = (today - loan.due_date).days
+        
+        report.append({
+            "loan_id": loan.id,
+            "book_title": title,
+            "member_email": loan.member.email,
+            "due_date": loan.due_date,
+            "days_overdue": days_over
+        })
+    return report
+
+@app.post("/api/librarians", response_model=schemas.LibrarianResponse)
+def create_librarian(
+    librarian: schemas.LibrarianCreate, 
+    current_user: models.Librarian = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """ADMIN-003: Create new Librarian Account (Admin Only)"""
+    # Strict RBAC Check
+    if current_user.role != "Admin":
+        raise HTTPException(status_code=403, detail="Only Admins can create librarian accounts")
+        
+    if db.query(models.Librarian).filter(models.Librarian.email == librarian.email).first():
+        raise HTTPException(status_code=400, detail="Email already exists")
+        
+    hashed_pw = pwd_context.hash(librarian.password)
+    new_lib = models.Librarian(
+        email=librarian.email,
+        hashed_password=hashed_pw,
+        full_name=librarian.full_name,
+        role=librarian.role
+    )
+    db.add(new_lib)
+    db.commit()
+    db.refresh(new_lib)
+    return new_lib
+
+# --- Admin / Maintenance Endpoints ---
+
+@app.patch("/api/members/{member_id}/status", response_model=schemas.MemberResponse)
+def update_member_status(
+    member_id: int, 
+    status_data: schemas.MemberStatusUpdate, 
+    current_user: models.Librarian = Depends(get_current_user), # RBAC: Only Librarians
+    db: Session = Depends(get_db)
+):
+    """MEM-003: Deactivate / Reactivate member account"""
+    if current_user.role not in ["Librarian", "Admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    member = db.query(models.Member).filter(models.Member.id == member_id).first()
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+    
+    member.status = status_data.status
+    db.commit()
+    db.refresh(member)
+    return member
+
+@app.put("/api/books/{book_id}", response_model=schemas.BookResponse)
+def update_book(
+    book_id: int, 
+    book_data: schemas.BookUpdate, 
+    current_user: models.Librarian = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
+    """BIM-004: Update Book Information"""
+    book = db.query(models.Book).filter(models.Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    
+    # Update fields if provided
+    for key, value in book_data.dict(exclude_unset=True).items():
+        setattr(book, key, value)
+    
+    db.commit()
+    db.refresh(book)
+    return book
+
+@app.delete("/api/items/{barcode}")
+def delete_book_item(
+    barcode: str, 
+    current_user: models.Librarian = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
+    """BIM-005: Remove Book Item"""
+    item = db.query(models.BookItem).filter(models.BookItem.barcode == barcode).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    
+    # Check Constraint: Cannot delete if currently borrowed
+    if item.status == "Borrowed":
+        raise HTTPException(status_code=400, detail="Cannot remove item that is currently on loan.")
+        
+    db.delete(item)
+    db.commit()
+    return {"message": "Item removed successfully"}
+
+@app.get("/api/reports/stats", response_model=schemas.DashboardStats)
+def get_dashboard_stats(
+    current_user: models.Librarian = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
+    """ADMIN-001: Generate Reports (Dashboard Stats)"""
+    
+    total_members = db.query(models.Member).count()
+    total_titles = db.query(models.Book).count()
+    total_items = db.query(models.BookItem).count()
+    
+    active_loans = db.query(models.Loan).filter(models.Loan.status == "Active").count()
+    
+    pending_reservations = db.query(models.Reservation).filter(models.Reservation.status == "Pending").count()
+    
+    # Sum of unpaid fines
+    total_fines = db.query(func.sum(models.Fine.amount)).filter(models.Fine.status == "Unpaid").scalar() or 0.0
+    
+    return {
+        "total_members": total_members,
+        "total_titles": total_titles,
+        "total_items": total_items,
+        "active_loans": active_loans,
+        "pending_reservations": pending_reservations,
+        "total_fines_unpaid": total_fines
+    }
+
+@app.get("/api/items/{barcode}/history", response_model=list[schemas.LoanResponse])
+def get_item_loan_history(
+    barcode: str,
+    current_user: models.Librarian = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """CIRC-005: View loan history of book item"""
+    loans = db.query(models.Loan).filter(
+        models.Loan.book_item_id == barcode
+    ).order_by(models.Loan.issue_date.desc()).all()
+    
+    if not loans:
+        # Check if item exists at least
+        item = db.query(models.BookItem).filter(models.BookItem.barcode == barcode).first()
+        if not item:
+            raise HTTPException(status_code=404, detail="Item not found")
+            
+    return loans
+
+@app.post("/api/loans/{loan_id}/lost")
+def mark_book_lost(
+    loan_id: int, 
+    request: schemas.MarkLostRequest, 
+    current_user: models.Librarian = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """BIM-005 / CIRC: Handle Lost Book"""
+    loan = db.query(models.Loan).filter(models.Loan.id == loan_id).first()
+    if not loan or loan.status != "Active":
+        raise HTTPException(status_code=400, detail="Active loan not found")
+
+    # 1. Update Loan
+    loan.status = "Lost"
+    loan.return_date = date.today() # Closed today
+
+    # 2. Update Item
+    item = loan.book_item
+    item.status = "Lost"
+
+    # 3. Create Fine (Replacement Fee)
+    fine = models.Fine(
+        loan_id=loan.id,
+        member_id=loan.member_id,
+        amount=request.replacement_fee,
+        reason="Replacement fee for lost book",
+        status="Unpaid"
+    )
+    db.add(fine)
+    db.commit()
+    return {"message": "Book marked as lost and fine created"}
+
+@app.get("/api/my/notifications", response_model=list[schemas.NotificationResponse])
+def get_my_notifications(
+    current_user: models.Member = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    return db.query(models.Notification).filter(
+        models.Notification.member_id == current_user.id
+    ).order_by(models.Notification.created_at.desc()).all()
+
+@app.post("/api/maintenance/expire_holds")
+def expire_stale_reservations(
+    current_user: models.Librarian = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Clean up reservations that have been waiting too long (3 days).
+    Logic: Mark Reservation 'Expired' -> Make Book 'Available'.
+    """
+    expiry_date = datetime.utcnow() - timedelta(days=HOLD_EXPIRY_DAYS)
+    
+    # Find fulfilled reservations that have expired
+    stale_reservations = db.query(models.Reservation).filter(
+        models.Reservation.status == "Fulfilled",
+        models.Reservation.reservation_date < expiry_date 
+        # Note: In a real prod DB, we would have a 'fulfillment_date' column. 
+        # Using 'reservation_date' acts as a proxy for this academic scope.
+    ).all()
+    
+    count = 0
+    for res in stale_reservations:
+        res.status = "Expired"
+        
+        # Find a book item of this title that is currently stuck in "Reserved" status
+        # and free it up.
+        stuck_item = db.query(models.BookItem).filter(
+            models.BookItem.book_id == res.book_id,
+            models.BookItem.status == "Reserved"
+        ).first()
+        
+        if stuck_item:
+            stuck_item.status = "Available"
+            print(f"♻️  Expired hold for {res.member_id}. {stuck_item.barcode} is now Available.")
+        
+        count += 1
+        
+    db.commit()
+    return {"message": f"Expired {count} stale reservations and released books."}
+
+@app.get("/api/reports/active_loans", response_model=list[schemas.ActiveLoanReportItem])
+def get_active_loans_report(
+    current_user: models.Librarian = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    loans = db.query(models.Loan).filter(models.Loan.status == "Active").all()
+    report = []
+    for loan in loans:
+        report.append({
+            "loan_id": loan.id,
+            "book_title": loan.book_item.book.title,
+            "member_email": loan.member.email,
+            "issue_date": loan.issue_date,
+            "due_date": loan.due_date
+        })
+    return report
+
+@app.get("/api/reports/member_activity", response_model=list[schemas.MemberActivityReportItem])
+def get_member_activity_report(
+    current_user: models.Librarian = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    members = db.query(models.Member).all()
+    report = []
+    for m in members:
+        paid_fines = sum(f.amount_paid for f in m.fines)
+        active_loans = len([l for l in m.loans if l.status == "Active"])
+        total_loans = len(m.loans)
+        
+        report.append({
+            "member_id": m.id,
+            "full_name": m.full_name,
+            "email": m.email,
+            "total_loans": total_loans,
+            "active_loans_count": active_loans,
+            "total_fines_paid": paid_fines
+        })
+    return report
+
+# --- Static File Serving (Keep this at the end) ---
+if os.path.exists("static_ui"):
+    app.mount("/assets", StaticFiles(directory="static_ui/assets"), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_react(full_path: str):
+        if full_path.startswith("api"):
+            return {"error": "API endpoint not found"}
+        return FileResponse("static_ui/index.html")

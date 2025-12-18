@@ -1,0 +1,9 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Simple global reset */
+body {
+  background-color: #f3f4f6; /* Light gray background */
+  color: #1f2937;
+}
