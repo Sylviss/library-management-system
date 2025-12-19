@@ -11,6 +11,8 @@ import MyFines from './pages/MyFines';
 import MemberManagement from './pages/MemberManagement';
 import Reports from './pages/Reports';
 import Profile from './pages/Profile';
+import AdminStaff from './pages/AdminStaff';
+import MemberDetails from './pages/MemberDetails';
 
 const ProtectedRoute = ({ children }) => {
   const { user } = useAuth();
@@ -43,7 +45,9 @@ function App() {
             <Route path="/members" element={<MemberManagement />} />
             <Route path="/circulation" element={<Circulation />} />
             <Route path="/reports" element={<Reports />} />
-
+            <Route path="/members/:id" element={<MemberDetails />} />
+            {/* Admin Routes */}
+            <Route path="/admin/staff" element={<AdminStaff />} />
           </Route>
 
           <Route path="*" element={<Navigate to="/dashboard" replace />} />

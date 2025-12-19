@@ -90,6 +90,7 @@ class ReservationResponse(BaseModel):
     member_id: int
     reservation_date: datetime
     status: str
+    queue_position: Optional[int] = None  # <--- NEW FIELD
 
     class Config:
         from_attributes = True
@@ -98,9 +99,10 @@ class ReservationResponse(BaseModel):
 class FineResponse(BaseModel):
     id: int
     amount: float
+    amount_paid: float = 0.0  # <--- ADD THIS LINE
     reason: str
     status: str
-    created_at: Optional[datetime] = None # Added field if you update models.py later, or ignore
+    created_at: Optional[datetime] = None
     
     class Config:
         from_attributes = True

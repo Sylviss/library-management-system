@@ -1,16 +1,15 @@
 from database import SessionLocal, engine, Base
 import models
 from passlib.context import CryptContext
-from datetime import date, timedelta
-from sqlalchemy import text  # <--- MAKE SURE THIS IS HERE
+from datetime import date, timedelta, datetime
+from sqlalchemy import text
+import random
 
 # Setup Password Hasher
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def reset_db():
     print("⚠️  Resetting database...")
-    
-    # 1. Force-Kill all other connections
     try:
         with engine.connect() as connection:
             connection.execution_options(isolation_level="AUTOCOMMIT")
@@ -23,80 +22,229 @@ def reset_db():
     except Exception as e:
         print(f"   (Note: Could not kill connections: {e})")
 
-    # 2. Drop Tables
     Base.metadata.drop_all(bind=engine)
-    
-    # 3. Re-create Tables
     Base.metadata.create_all(bind=engine)
     print("✅ Database reset complete.")
 
 def seed_db():
     db = SessionLocal()
     try:
-        print("🌱 Seeding data...")
+        print("🌱 Seeding rich data...")
         
-        # --- 1. Create Users ---
-        # Password for all is "123"
-        pw_hash = pwd_context.hash("123")
+        # =====================================================
+        # 1. USERS
+        # =====================================================
+        pw = pwd_context.hash("123")
         
-        admin = models.Librarian(email="admin@library.com", hashed_password=pw_hash, full_name="Super Admin", role="Admin")
+        # Staff
+        admin = models.Librarian(email="admin@library.com", hashed_password=pw, full_name="Super Admin", role="Admin")
+        lib = models.Librarian(email="lib@library.com", hashed_password=pw, full_name="Librarian Linda", role="Librarian")
         
-        alice = models.Member(email="alice@test.com", hashed_password=pw_hash, full_name="Alice Engineer")
-        bob = models.Member(email="bob@test.com", hashed_password=pw_hash, full_name="Bob Manager")
-        charlie = models.Member(email="charlie@test.com", hashed_password=pw_hash, full_name="Charlie Newbie")
-        
-        db.add_all([admin, alice, bob, charlie])
-        db.commit() # Commit to generate IDs
+        # Members
+        alice = models.Member(email="alice@test.com", hashed_password=pw, full_name="Alice Active")
+        bob = models.Member(email="bob@test.com", hashed_password=pw, full_name="Bob The Debtor")
+        charlie = models.Member(email="charlie@test.com", hashed_password=pw, full_name="Charlie Queue")
+        david = models.Member(email="david@test.com", hashed_password=pw, full_name="David Late")
+        eve = models.Member(email="eve@test.com", hashed_password=pw, full_name="Eve Reader")
+        frank = models.Member(email="frank@test.com", hashed_password=pw, full_name="Frank Newbie")
 
-        # --- 2. Create Books ---
-        b1 = models.Book(title="Python for Beginners", author="Guido", isbn="111", genre="Tech")
-        b2 = models.Book(title="Advanced Data Science", author="Andrew Ng", isbn="222", genre="Tech")
-        b3 = models.Book(title="The Great Gatsby", author="F. Scott", isbn="333", genre="Fiction")
-        b4 = models.Book(title="Project Management 101", author="Steve Jobs", isbn="444", genre="Business")
-        
-        db.add_all([b1, b2, b3, b4])
+        db.add_all([admin, lib, alice, bob, charlie, david, eve, frank])
         db.commit()
 
-        # --- 3. Create Physical Items ---
-        # We add 2 copies of Python, 1 of others
-        i1_a = models.BookItem(barcode="ITEM-PY-01", book_id=b1.id, status="Available")
-        i1_b = models.BookItem(barcode="ITEM-PY-02", book_id=b1.id, status="Available")
-        i2_a = models.BookItem(barcode="ITEM-DS-01", book_id=b2.id, status="Available")
-        i3_a = models.BookItem(barcode="ITEM-GAT-01", book_id=b3.id, status="Available")
+        # =====================================================
+        # 2. BOOKS & ITEMS
+        # =====================================================
+        books_data = [
+            # Tech
+            {"title": "Python Crash Course", "author": "Eric Matthes", "genre": "Tech", "items": 2},
+            {"title": "Clean Code", "author": "Robert C. Martin", "genre": "Tech", "items": 1},
+            {"title": "Introduction to Algorithms", "author": "Thomas H. Cormen", "genre": "Tech", "items": 1},
+            # Fiction
+            {"title": "The Great Gatsby", "author": "F. Scott Fitzgerald", "genre": "Fiction", "items": 2},
+            {"title": "1984", "author": "George Orwell", "genre": "Fiction", "items": 1}, # High demand
+            {"title": "The Hobbit", "author": "J.R.R. Tolkien", "genre": "Fantasy", "items": 1},
+            {"title": "Harry Potter", "author": "JK Rowling", "genre": "Fantasy", "items": 2},
+            # Sci-Fi
+            {"title": "Dune", "author": "Frank Herbert", "genre": "Sci-Fi", "items": 1},
+            {"title": "Neuromancer", "author": "William Gibson", "genre": "Sci-Fi", "items": 0}, # Out of stock completely
+        ]
+
+        created_books = {} # Map Title -> DB Object
+        created_items = {} # Map Title -> List of Barcodes
+
+        for b_data in books_data:
+            book = models.Book(
+                title=b_data["title"], 
+                author=b_data["author"], 
+                genre=b_data["genre"],
+                isbn=f"978-{random.randint(100000, 999999)}"
+            )
+            db.add(book)
+            db.commit()
+            created_books[book.title] = book
+            
+            created_items[book.title] = []
+            for i in range(b_data["items"]):
+                barcode = f"ITEM-{book.id}-{i+1}"
+                item = models.BookItem(barcode=barcode, book_id=book.id, status="Available")
+                db.add(item)
+                created_items[book.title].append(item)
+            db.commit()
+
+        # =====================================================
+        # 3. LOAN HISTORY (For ML Recommendations)
+        # =====================================================
+        # Logic: Alice and Eve have similar taste (Fantasy).
+        # Eve read "Harry Potter" + "Hobbit". Alice read "Harry Potter".
+        # ML should recommend "Hobbit" to Alice.
         
-        db.add_all([i1_a, i1_b, i2_a, i3_a])
+        # Eve's History
+        h1 = models.Loan(book_item_id=created_items["Harry Potter"][0].barcode, member_id=eve.id, status="Returned", due_date=date.today(), return_date=date.today())
+        h2 = models.Loan(book_item_id=created_items["The Hobbit"][0].barcode, member_id=eve.id, status="Returned", due_date=date.today(), return_date=date.today())
+        
+        # Alice's History
+        h3 = models.Loan(book_item_id=created_items["Harry Potter"][1].barcode, member_id=alice.id, status="Returned", due_date=date.today(), return_date=date.today())
+
+        db.add_all([h1, h2, h3])
+        
+        # Log Views for Frank (He viewed Python, so suggest Clean Code)
+        v1 = models.BookView(member_id=frank.id, book_id=created_books["Python Crash Course"].id)
+        # Alice viewed Dune
+        v2 = models.BookView(member_id=alice.id, book_id=created_books["Dune"].id)
+        
+        db.add_all([v1, v2])
         db.commit()
 
-        # --- 4. Create Loan History (The "Smart" Part) ---
-        # Scenario: Alice likes Tech. She read "Python" and "Data Science".
+        # =====================================================
+        # 4. ACTIVE LOANS & OVERDUE (Dynamic Fines Test)
+        # =====================================================
         
-        # Alice borrowed Python (Returned)
-        l1 = models.Loan(book_item_id=i1_a.barcode, member_id=alice.id, issue_date=date.today()-timedelta(days=10), due_date=date.today(), return_date=date.today(), status="Returned")
-        # Alice borrowed Data Science (Returned)
-        l2 = models.Loan(book_item_id=i2_a.barcode, member_id=alice.id, issue_date=date.today()-timedelta(days=5), due_date=date.today(), return_date=date.today(), status="Returned")
+        # Bob has a VERY overdue book
+        bad_loan = models.Loan(
+            book_item_id=created_items["Clean Code"][0].barcode,
+            member_id=bob.id,
+            status="Active",
+            issue_date=date.today() - timedelta(days=45),
+            due_date=date.today() - timedelta(days=30) 
+        )
+        created_items["Clean Code"][0].status = "Borrowed"
         
-        db.add_all([l1, l2])
+        # --- NEW: Manually insert the fine that the scheduler WOULD have created ---
+        # 30 days overdue * $1 = $30
+        bob_fine = models.Fine(
+            loan_id=None, # We don't have the ID yet until commit, see fix below
+            member_id=bob.id,
+            amount=30.0,
+            reason="Overdue",
+            status="Unpaid"
+        )
+        
+        # Add loan first to get ID
+        db.add(bad_loan)
+        db.commit()
+        
+        # Now link fine to loan
+        bob_fine.loan_id = bad_loan.id
+        db.add(bob_fine)
         db.commit()
 
-        # --- 5. Create Views (Recent Interest) ---
-        # Scenario: Charlie is new. He hasn't borrowed anything.
-        # But he just CLICKED on "Python for Beginners".
+        # David has a currently active loan (Not overdue)
+        good_loan = models.Loan(
+            book_item_id=created_items["Dune"][0].barcode,
+            member_id=david.id,
+            status="Active",
+            issue_date=date.today(),
+            due_date=date.today() + timedelta(days=14)
+        )
+        created_items["Dune"][0].status = "Borrowed"
+
+        db.add_all([bad_loan, good_loan])
+        db.commit()
+
+        # =====================================================
+        # 5. RESERVATIONS (Queue Test)
+        # =====================================================
         
-        v1 = models.BookView(member_id=charlie.id, book_id=b1.id)
-        db.add(v1)
+        # "1984" is borrowed by Alice (let's say she grabbed the only copy just now)
+        loan_1984 = models.Loan(
+            book_item_id=created_items["1984"][0].barcode, 
+            member_id=alice.id, 
+            status="Active",
+            due_date=date.today() + timedelta(days=14)
+        )
+        created_items["1984"][0].status = "Borrowed"
+        db.add(loan_1984)
+        db.commit()
+
+        # Charlie wants "1984" (Position #1)
+        res1 = models.Reservation(
+            book_id=created_books["1984"].id,
+            member_id=charlie.id,
+            status="Pending",
+            reservation_date=datetime.now() - timedelta(hours=5)
+        )
+        # David wants "1984" (Position #2)
+        res2 = models.Reservation(
+            book_id=created_books["1984"].id,
+            member_id=david.id,
+            status="Pending",
+            reservation_date=datetime.now() - timedelta(hours=1)
+        )
+        
+        # Eve had a reservation for "Python Crash Course" and it is READY (Fulfilled)
+        # Note: We need to mark an item as "Reserved" for this to be valid logic
+        res3 = models.Reservation(
+            book_id=created_books["Python Crash Course"].id,
+            member_id=eve.id,
+            status="Fulfilled",
+            reservation_date=datetime.now() - timedelta(days=1)
+        )
+        created_items["Python Crash Course"][0].status = "Reserved" # Item 1 reserved for Eve
+        
+        # Notification for Eve
+        notif = models.Notification(
+            member_id=eve.id, 
+            message=f"Good news! The book 'Python Crash Course' is now available for pickup."
+        )
+
+        db.add_all([res1, res2, res3, notif])
+        db.commit()
+
+        # =====================================================
+        # 6. FINES (Recorded Debt)
+        # =====================================================
+        
+        # Charlie returned a book late previously. He has a $5 unpaid fine.
+        # Loan ID doesn't strictly matter for the fine balance check, but good for foreign key.
+        past_loan = models.Loan(book_item_id=created_items["The Great Gatsby"][0].barcode, member_id=charlie.id, status="Returned", due_date=date.today(), return_date=date.today())
+        db.add(past_loan)
+        db.commit()
+        
+        fine = models.Fine(
+            loan_id=past_loan.id,
+            member_id=charlie.id,
+            amount=5.0,
+            status="Unpaid",
+            reason="Overdue 5 days"
+        )
+        db.add(fine)
         db.commit()
 
         print("✅ Seeding complete!")
         print("------------------------------------------------")
-        print("User Login: alice@test.com / 123")
-        print("Admin Login: admin@library.com / 123")
-        print("Recommendation Test: Check recommendations for Charlie (Member ID 3).")
-        print("   -> Charlie viewed 'Python'. Alice read 'Python' AND 'Data Science'.")
-        print("   -> Result should be: 'Advanced Data Science'.")
+        print("Admin: admin@library.com / 123")
+        print("Librarian: lib@library.com / 123")
+        print("------------------------------------------------")
+        print("User: alice@test.com  -> Good history, borrowing '1984'")
+        print("User: bob@test.com    -> BLOCKED! (30 days overdue book)")
+        print("User: charlie@test.com-> Waiting List #1 for '1984', Owes $5")
+        print("User: david@test.com  -> Waiting List #2 for '1984'")
+        print("User: eve@test.com    -> Pickup Ready: 'Python Crash Course'")
         print("------------------------------------------------")
 
     except Exception as e:
         print(f"❌ Error seeding data: {e}")
+        db.rollback()
     finally:
         db.close()
 

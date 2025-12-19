@@ -6,20 +6,25 @@ import { Clock, RefreshCw, CheckCircle, AlertTriangle, BookOpen } from 'lucide-r
 export default function MyLoans() {
   const [loans, setLoans] = useState({ active_loans: [], past_loans: [] });
   const [loading, setLoading] = useState(true);
+  const [reservations, setReservations] = useState([]);
 
-  const fetchLoans = async () => {
+  const fetchData = async () => {
     try {
-      const res = await api.get('/my/loans');
-      setLoans(res.data);
+      const [loansRes, resRes] = await Promise.all([
+        api.get('/my/loans'),
+        api.get('/my/reservations')
+      ]);
+      setLoans(loansRes.data);
+      setReservations(resRes.data);
     } catch (error) {
-      toast.error("Failed to load loans");
+      toast.error("Failed to load data");
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    fetchLoans();
+    fetchData();
   }, []);
 
   const handleRenew = async (loanId) => {
@@ -40,6 +45,17 @@ export default function MyLoans() {
     const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)); 
     return diffDays;
   };
+
+  const handleCancelReservation = async (id) => {
+  if(!window.confirm("Cancel this reservation?")) return;
+  try {
+    await api.post(`/reservations/${id}/cancel`);
+    toast.success("Reservation Canceled");
+    fetchData(); // Refresh list
+  } catch (error) {
+    toast.error("Failed to cancel");
+  }
+};
 
   if (loading) return <div className="p-8 text-center text-gray-500">Loading your library records...</div>;
 
@@ -149,7 +165,62 @@ export default function MyLoans() {
           </table>
         </div>
       </div>
+      {/* --- Section 3: Reservations --- */}
+      <div className="mt-12">
+        <h2 className="text-xl font-bold text-gray-800 mb-4 flex items-center gap-2">
+          <Clock className="text-orange-500" /> My Reservations
+        </h2>
 
+        <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+          <table className="w-full text-left text-sm text-gray-600">
+            <thead className="bg-gray-50 text-gray-900 border-b">
+              <tr>
+                <th className="p-4">Book ID</th>
+                <th className="p-4">Reserved Date</th>
+                <th className="p-4">Status</th>
+                <th className="p-4 text-right">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {reservations.length === 0 ? (
+                <tr><td colSpan="4" className="p-8 text-center text-gray-400">No active reservations</td></tr>
+              ) : (
+                reservations.map(res => (
+                  <tr key={res.id} className="border-b hover:bg-gray-50">
+                    <td className="p-4">#{res.book_id}</td>
+                    <td className="p-4">{new Date(res.reservation_date).toLocaleDateString()}</td>
+                    <td className="p-4">
+                      <div className="flex flex-col">
+                        {/* Status Badge */}
+                        <span className={`w-fit px-2 py-1 rounded text-xs font-bold ${
+                          res.status === 'Fulfilled' ? 'bg-green-100 text-green-700' : 'bg-yellow-100 text-yellow-700'
+                        }`}>
+                          {res.status === 'Fulfilled' ? 'Ready for Pickup' : 'Waiting List'}
+                        </span>
+                        
+                        {/* Queue Position */}
+                        {res.status === 'Pending' && (
+                          <span className="text-xs text-gray-500 mt-1">
+                            Position: #{res.queue_position} in line
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                    <td className="p-4 text-right">
+                      <button 
+                        onClick={() => handleCancelReservation(res.id)}
+                        className="text-red-500 hover:underline text-xs"
+                      >
+                        Cancel
+                      </button>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   );
 }

@@ -125,7 +125,7 @@ export default function MemberManagement() {
                     {member.status}
                   </span>
                 </td>
-                <td className="p-4 text-right">
+                {/* <td className="p-4 text-right">
                   <button 
                     onClick={() => toggleStatus(member)}
                     className={`text-sm font-medium hover:underline ${
@@ -134,7 +134,34 @@ export default function MemberManagement() {
                   >
                     {member.status === 'Active' ? 'Block Account' : 'Activate Account'}
                   </button>
-                </td>
+                </td> */}
+                <td className="p-4 text-right space-x-4">
+                {/* NEW: View Button */}
+                <a 
+                  href={`/members/${member.id}`} // React Router will handle this via <Link> ideally, but href works for now
+                  onClick={(e) => {
+                    e.preventDefault();
+                    // Assuming you import useNavigate hook at top: const navigate = useNavigate();
+                    // navigate(`/members/${member.id}`);
+                    // Since I can't see your full file context, I'll use window.location as fallback 
+                    // or you can implement the Link/navigate correctly.
+                    window.location.href = `/members/${member.id}`; 
+                  }}
+                  className="text-sm font-medium text-blue-600 hover:underline"
+                >
+                  View Details
+                </a>
+
+                {/* Existing Block Button */}
+                <button 
+                  onClick={() => toggleStatus(member)}
+                  className={`text-sm font-medium hover:underline ${
+                    member.status === 'Active' ? 'text-red-600' : 'text-green-600'
+                  }`}
+                >
+                  {member.status === 'Active' ? 'Block' : 'Activate'}
+                </button>
+              </td>
               </tr>
             ))}
             {members.length === 0 && !loading && (

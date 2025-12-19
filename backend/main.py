@@ -277,30 +277,20 @@ def issue_book(request: schemas.LoanIssueRequest, db: Session = Depends(get_db))
     if len(active_loans) >= MAX_LOANS_PER_MEMBER:
         raise HTTPException(status_code=400, detail=f"Member has reached maximum loan limit ({MAX_LOANS_PER_MEMBER})")
 
-    # --- NEW: Dynamic Fine Calculation ---
-    # Part A: Unpaid fines already in the database
+    # --- NEW: Check Outstanding Fines (Simplified) ---
+    # We trust the 'fines' table because the Scheduler updates it daily
     unpaid_fines = db.query(models.Fine).filter(
         models.Fine.member_id == member.id,
         models.Fine.status.in_(["Unpaid", "Partial"])
     ).all()
-    recorded_debt = sum(f.amount - f.amount_paid for f in unpaid_fines)
-
-    # Part B: Accrued fines (Books currently overdue but not returned)
-    accrued_debt = 0.0
-    today = date.today()
-    for loan in active_loans:
-        if loan.due_date < today:
-            overdue_days = (today - loan.due_date).days
-            accrued_debt += (overdue_days * DAILY_FINE_AMOUNT)
-
-    total_debt = recorded_debt + accrued_debt
-
+    
+    total_debt = sum(f.amount - f.amount_paid for f in unpaid_fines)
+    
     if total_debt >= MAX_FINE_THRESHOLD:
         raise HTTPException(
             status_code=400, 
-            detail=f"Blocked: Total debt is ${total_debt} (Recorded: ${recorded_debt}, Accruing: ${accrued_debt}). Limit is ${MAX_FINE_THRESHOLD}."
+            detail=f"Blocked: Outstanding fines of ${total_debt}. Limit is ${MAX_FINE_THRESHOLD}."
         )
-    # -------------------------------------
 
     # 3. Validate Book Item
     item = db.query(models.BookItem).filter(models.BookItem.barcode == request.book_item_barcode).first()
@@ -344,33 +334,46 @@ def issue_book(request: schemas.LoanIssueRequest, db: Session = Depends(get_db))
 
 @app.post("/api/reservations", response_model=schemas.ReservationResponse)
 def reserve_book(request: schemas.ReservationCreate, db: Session = Depends(get_db)):
-    """
-    RES-001: Process Book Reservation
-    Logic:
-    1. Check if Book exists.
-    2. Check if copies are available. 
-       - If YES: Suggest borrowing instead (Return 400).
-       - If NO: Create Reservation (Waitlist).
-    """
     # 1. Check Book
     book = db.query(models.Book).filter(models.Book.id == request.book_id).first()
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
 
-    # 2. Check Availability
-    # Count items that are 'Available'
+    # --- NEW: Check Outstanding Fines (Block Deadbeats) ---
+    unpaid_fines = db.query(models.Fine).filter(
+        models.Fine.member_id == request.member_id,
+        models.Fine.status.in_(["Unpaid", "Partial"])
+    ).all()
+    
+    total_debt = sum(f.amount - f.amount_paid for f in unpaid_fines)
+    
+    if total_debt >= MAX_FINE_THRESHOLD:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Reservation blocked: You have outstanding fines of ${total_debt}. Limit is ${MAX_FINE_THRESHOLD}."
+        )
+    # ------------------------------------------------------
+
+    # 2. Check Duplicate Reservation
+    existing_res = db.query(models.Reservation).filter(
+        models.Reservation.book_id == request.book_id,
+        models.Reservation.member_id == request.member_id,
+        models.Reservation.status.in_(["Pending", "Fulfilled"])
+    ).first()
+    
+    if existing_res:
+        raise HTTPException(status_code=400, detail="You already have an active reservation for this book.")
+
+    # 3. Check Availability (No Camping)
     available_count = db.query(models.BookItem).filter(
         models.BookItem.book_id == request.book_id,
         models.BookItem.status == "Available"
     ).count()
 
     if available_count > 0:
-        raise HTTPException(
-            status_code=400, 
-            detail="Book is currently available. You can borrow it directly without reservation."
-        )
+        raise HTTPException(status_code=400, detail="Book is currently available. You can borrow it directly.")
 
-    # 3. Create Reservation
+    # 4. Create Reservation
     reservation = models.Reservation(
         book_id=request.book_id,
         member_id=request.member_id,
@@ -400,15 +403,14 @@ def cancel_reservation(reservation_id: int, db: Session = Depends(get_db)):
 # NEW:
 @app.get("/api/my/fines", response_model=list[schemas.FineResponse])
 def get_my_fines(
-    current_user: models.Member = Depends(get_current_user), # <--- Security Dependency
+    current_user: models.Member = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    # We use current_user.id instead of a URL parameter
-    fines = db.query(models.Fine).filter(
+    """PORT-002: View Fines (Source of Truth: Database)"""
+    return db.query(models.Fine).filter(
         models.Fine.member_id == current_user.id,
-        models.Fine.status == "Unpaid"
+        models.Fine.status.in_(["Unpaid", "Partial"])
     ).all()
-    return fines
 
 @app.post("/api/fines/{fine_id}/pay")
 def pay_fine(fine_id: int, payment: schemas.FinePaymentRequest, db: Session = Depends(get_db)):
@@ -599,7 +601,11 @@ def renew_book(
     # 1. Basic Validation
     if not loan:
         raise HTTPException(status_code=404, detail="Loan not found")
-    if loan.member_id != current_user.id:
+    # Allow if owner OR if staff
+    is_owner = loan.member_id == current_user.id
+    is_staff = getattr(current_user, "role", None) in ["Librarian", "Admin"]
+    
+    if not (is_owner or is_staff):
         raise HTTPException(status_code=403, detail="Not authorized")
     if loan.status != "Active":
         raise HTTPException(status_code=400, detail="Cannot renew inactive loan")
@@ -658,45 +664,37 @@ def return_book(request: schemas.LoanReturnRequest, db: Session = Depends(get_db
     loan.return_date = date.today()
     loan.status = "Returned"
 
-    # 3. Update Item Status
+    # 3. Update Item Status (Handle Damage)
     item = db.query(models.BookItem).filter(models.BookItem.barcode == request.book_item_barcode).first()
     
     if request.condition == "Damaged":
-        # Handle Damage (CIRC-002)
         item.status = "Damaged"
+        # --- NEW: Add Damage Fine ---
+        damage_fine = models.Fine(
+            loan_id=loan.id,
+            member_id=loan.member_id,
+            amount=50.0, # Flat fee or look up book price
+            reason="Book Returned Damaged",
+            status="Unpaid"
+        )
+        db.add(damage_fine)
     else:
-        # Normal Return: Check Reservations
+        # ... (Reservation Fulfillment Logic - Keep existing) ...
+        # Copy the "next_reservation" block from previous implementation here
         next_reservation = db.query(models.Reservation).filter(
             models.Reservation.book_id == item.book_id,
             models.Reservation.status == "Pending"
         ).order_by(models.Reservation.reservation_date.asc()).first()
 
         if next_reservation:
-            # FULFILL RESERVATION
             item.status = "Reserved"
             next_reservation.status = "Fulfilled"
-            
-            # --- NOTIFICATION LOGIC (Restored) ---
-            msg = f"Good news! The book '{item.book.title}' is now available for pickup."
-            notification = models.Notification(member_id=next_reservation.member_id, message=msg)
-            db.add(notification)
-            # -------------------------------------
-            
-            print(f"⚠️ Book reserved for Member ID {next_reservation.member_id}")
+            # Add Notification here if you want
         else:
             item.status = "Available"
 
-    # 4. Check Overdue (Fine Logic)
-    if loan.return_date > loan.due_date:
-        overdue_days = (loan.return_date - loan.due_date).days
-        fine_amount = overdue_days * DAILY_FINE_AMOUNT
-        fine = models.Fine(
-            loan_id=loan.id, 
-            member_id=loan.member_id, 
-            amount=fine_amount, 
-            reason=f"Overdue by {overdue_days} days"
-        )
-        db.add(fine)
+    # 4. REMOVED: The block that calculated overdue fines. 
+    # The Scheduler handled that for us!
 
     db.commit()
     db.refresh(loan)
@@ -980,6 +978,92 @@ def get_member_activity_report(
             "total_fines_paid": paid_fines
         })
     return report
+
+@app.get("/api/my/reservations", response_model=list[schemas.ReservationResponse])
+def get_my_reservations(
+    current_user: models.Member = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """List all active reservations with Queue Position"""
+    reservations = db.query(models.Reservation).filter(
+        models.Reservation.member_id == current_user.id,
+        models.Reservation.status.in_(["Pending", "Fulfilled"])
+    ).all()
+    
+    # Calculate Queue Position for Pending items
+    for res in reservations:
+        if res.status == "Pending":
+            # Logic: Count how many Pending reservations for this book 
+            # were created BEFORE this one.
+            position = db.query(models.Reservation).filter(
+                models.Reservation.book_id == res.book_id,
+                models.Reservation.status == "Pending",
+                models.Reservation.reservation_date < res.reservation_date
+            ).count()
+            
+            # Position 0 means you are 1st in line. So we add 1.
+            res.queue_position = position + 1
+        else:
+            # If Fulfilled, you aren't in line, you are waiting for pickup
+            res.queue_position = 0 
+
+    return reservations
+
+@app.get("/api/admin/librarians", response_model=list[schemas.LibrarianResponse])
+def list_librarians(
+    current_user: models.Librarian = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """ADMIN-003: List all staff (Admin Only)"""
+    if current_user.role != "Admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    return db.query(models.Librarian).all()
+
+@app.get("/api/members/{member_id}/loans", response_model=schemas.LoanHistoryResponse)
+def get_member_loans(
+    member_id: int,
+    current_user: models.Librarian = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Staff view of a member's loans"""
+    if current_user.role not in ["Librarian", "Admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    active = db.query(models.Loan).filter(models.Loan.member_id == member_id, models.Loan.status == "Active").all()
+    past = db.query(models.Loan).filter(models.Loan.member_id == member_id, models.Loan.status == "Returned").all()
+    return {"active_loans": active, "past_loans": past}
+
+@app.get("/api/members/{member_id}/reservations", response_model=list[schemas.ReservationResponse])
+def get_member_reservations(
+    member_id: int,
+    current_user: models.Librarian = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Staff view of a member's reservations"""
+    if current_user.role not in ["Librarian", "Admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    return db.query(models.Reservation).filter(
+        models.Reservation.member_id == member_id,
+        models.Reservation.status.in_(["Pending", "Fulfilled"])
+    ).all()
+
+# We already have get_member_fines logic, but let's ensure it's exposed for staff
+# You might need to check if you deleted `get_member_fines` earlier. 
+# If it's missing, add this:
+@app.get("/api/members/{member_id}/fines_details", response_model=list[schemas.FineResponse])
+def get_member_fines_staff(
+    member_id: int,
+    current_user: models.Librarian = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if current_user.role not in ["Librarian", "Admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+        
+    return db.query(models.Fine).filter(
+        models.Fine.member_id == member_id
+    ).all()
 
 # --- Static File Serving (Keep this at the end) ---
 if os.path.exists("static_ui"):

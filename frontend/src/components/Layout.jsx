@@ -5,11 +5,12 @@ import {
   Library, Settings, LogOut, FileText, Repeat 
 } from 'lucide-react';
 import Notifications from './Notifications'; // Add this
+import { Shield } from 'lucide-react';
 
 const SidebarItem = ({ to, icon: Icon, label }) => {
   const location = useLocation();
   const isActive = location.pathname === to;
-  
+
   return (
     <Link 
       to={to} 
@@ -28,6 +29,7 @@ const SidebarItem = ({ to, icon: Icon, label }) => {
 export default function Layout() {
   const { user, logout } = useAuth();
   const isStaff = user?.role === 'Librarian' || user?.role === 'Admin';
+  const isAdmin = user?.role === 'Admin'; // <--- NEW CHECK
 
   return (
     <div className="flex h-screen bg-gray-100">
@@ -58,9 +60,17 @@ export default function Layout() {
               <SidebarItem to="/members" icon={Users} label="Member Management" />
               <SidebarItem to="/circulation" icon={Repeat} label="Circulation Desk" />
               <SidebarItem to="/reports" icon={FileText} label="Reports" />
+              
+              {/* --- NEW: Admin Only Link --- */}
+              {isAdmin && (
+                <div className="pt-2 mt-2 border-t border-gray-800">
+                  <SidebarItem to="/admin/staff" icon={Shield} label="Staff Settings" />
+                </div>
+              )}
             </>
           )}
         </nav>
+        
 
         <div className="p-4 border-t border-gray-800">
           <SidebarItem to="/profile" icon={Settings} label="My Profile" />
