@@ -4,9 +4,57 @@ from passlib.context import CryptContext
 from datetime import date, timedelta, datetime
 from sqlalchemy import text
 import random
-
+import requests
+import time
 # Setup Password Hasher
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+SEARCH_QUERIES = [
+    "isbn:9780132350884", # Clean Code
+    "isbn:9780201616224", # Pragmatic Programmer
+    "isbn:9780135957059", # Refactoring (Fowler)
+    "isbn:9780134494166", # Design Patterns (GoF)
+    "intitle:The Great Gatsby",
+    "intitle:1984 George Orwell",
+    "intitle:The Hobbit J.R.R. Tolkien",
+    "intitle:Dune Frank Herbert",
+    "intitle:The Fellowship of the Ring",
+    "intitle:The Two Towers",
+    "intitle:The Return of the King",
+    "intitle:Harry Potter and the Sorcerer's Stone",
+    "intitle:Harry Potter and the Chamber of Secrets",
+    "intitle:Harry Potter and the Prisoner of Azkaban",
+    "intitle:Brave New World Aldous Huxley",
+    "intitle:Fahrenheit 451 Ray Bradbury",
+    "intitle:The Catcher in the Rye",
+    "intitle:Thinking Fast and Slow",
+    "intitle:Sapiens Yuval Noah Harari",
+    "intitle:Atomic Habits James Clear"
+]
+
+def fetch_book_from_google(query):
+    """Helper to fetch data from Google Books API"""
+    try:
+        url = f"https://www.googleapis.com/books/v1/volumes?q={query}"
+        res = requests.get(url, timeout=5)
+        data = res.json()
+        if "items" not in data: return None
+        
+        info = data["items"][0]["volumeInfo"]
+        return {
+            "title": info.get("title"),
+            "author": ", ".join(info.get("authors", ["Unknown"])),
+            "isbn": next((id['identifier'] for id in info.get("industryIdentifiers", []) if id['type'] == 'ISBN_13'), str(random.randint(1000000000000, 9999999999999))),
+            "publisher": info.get("publisher"),
+            "publication_year": info.get("publishedDate", "")[:4] if info.get("publishedDate") else "2020",
+            "description": info.get("description", "No description available."),
+            "cover_image_url": info.get("imageLinks", {}).get("thumbnail"),
+            "genre": info.get("categories", ["General"])[0]
+        }
+    except Exception as e:
+        print(f"   [Error] Could not fetch {query}: {e}")
+        return None
+
 
 def reset_db():
     print("⚠️  Resetting database...")
@@ -90,6 +138,29 @@ def seed_db():
                 db.add(item)
                 created_items[book.title].append(item)
             db.commit()
+            
+        books_created = []
+        for query in SEARCH_QUERIES:
+            print(f"   -> Fetching: {query}")
+            book_data = fetch_book_from_google(query)
+            if book_data:
+                # Check for existing title to avoid duplicates
+                existing = db.query(models.Book).filter(models.Book.title == book_data['title']).first()
+                if not existing:
+                    book = models.Book(**book_data)
+                    db.add(book)
+                    db.commit()
+                    books_created.append(book)
+                    
+                    # Create 1-3 items for each book
+                    for i in range(random.randint(1, 3)):
+                        barcode = f"BCG-{book.id}-{i+1}"
+                        item = models.BookItem(barcode=barcode, book_id=book.id, status="Available")
+                        db.add(item)
+                    db.commit()
+            time.sleep(0.2) # Minor delay for API rate limits
+
+        print(f"✅ Created {len(books_created)} unique book titles.")
 
         # =====================================================
         # 3. LOAN HISTORY (For ML Recommendations)
