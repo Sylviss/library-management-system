@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import api from '../api';
 import toast from 'react-hot-toast';
-import { Shield, UserPlus, Key } from 'lucide-react';
+import { Shield, UserPlus, Key, Trash2  } from 'lucide-react';
 
 export default function AdminStaff() {
   const [staff, setStaff] = useState([]);
@@ -102,6 +102,25 @@ export default function AdminStaff() {
                       className="text-gray-500 hover:text-purple-600 text-sm flex items-center gap-1 ml-auto"
                     >
                       <Key size={16} /> Reset Password
+                    </button>
+                  )}
+                </td>
+                <td className="p-4 text-right flex gap-3 justify-end">
+                  <button onClick={() => setResetId(s.id)} className="..."> <Key size={16}/> </button>
+                  
+                  {/* NEW: Delete Button */}
+                  {s.role !== 'Admin' && (
+                    <button 
+                      onClick={async () => {
+                        if(window.confirm(`Delete staff account ${s.full_name}?`)) {
+                          await api.delete(`/admin/librarians/${s.id}`);
+                          fetchStaff();
+                          toast.success("Staff removed");
+                        }
+                      }}
+                      className="text-red-400 hover:text-red-600"
+                    >
+                      <Trash2 size={16} />
                     </button>
                   )}
                 </td>

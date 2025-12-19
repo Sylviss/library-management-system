@@ -14,6 +14,7 @@ export default function BookCatalog() {
   const [recommendations, setRecommendations] = useState([]);
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
+  const [recTitle, setRecTitle] = useState("Recommended For You");
 
   // Import Modal State
   const [showImport, setShowImport] = useState(false);
@@ -64,13 +65,26 @@ export default function BookCatalog() {
   };
 
   const fetchRecommendations = async () => {
-    // Only fetch for members
     if (!isStaff && user?.id) {
       try {
+        // 1. Try ML Engine
         const res = await api.get(`/recommendations?member_id=${user.id}`);
-        setRecommendations(res.data);
+        
+        if (res.data.length > 0) {
+          setRecommendations(res.data);
+          setRecTitle("✨ Recommended For You");
+        } else {
+          // 2. Fallback to Popular Books
+          const popularRes = await api.get('/books/popular');
+          setRecommendations(popularRes.data);
+          setRecTitle("🔥 Trending Now");
+        }
       } catch (error) {
-        console.error("ML Error", error);
+        console.error("Recommendation fetch error", error);
+        // Fallback on error too
+        const popularRes = await api.get('/books/popular');
+        setRecommendations(popularRes.data);
+        setRecTitle("🔥 Popular in Library");
       }
     }
   };
@@ -244,9 +258,9 @@ export default function BookCatalog() {
 
       {/* Recommendations Section (Members Only) */}
       {!isStaff && recommendations.length > 0 && (
-        <div className="bg-gradient-to-r from-blue-50 to-indigo-50 p-6 rounded-2xl border border-blue-100">
+        <div className="bg-gradient-to-r from-blue-50 to-indigo-50 p-6 rounded-2xl border border-blue-100 mb-8">
           <h2 className="text-xl font-bold text-blue-900 mb-4 flex items-center gap-2">
-            ✨ Recommended For You
+            {recTitle} {/* <--- DYNAMIC TITLE */}
           </h2>
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-6">
             {recommendations.map(book => <BookCard key={book.id} book={book} highlight />)}
@@ -257,11 +271,26 @@ export default function BookCatalog() {
       {/* Main Catalog Grid */}
       {loading ? (
         <div className="text-center py-20 text-gray-500">Loading library...</div>
-      ) : (
+      ) : books.length > 0 ? (
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-6">
           {books.map(book => (
             <BookCard key={book.id} book={book} />
           ))}
+        </div>
+      ) : (
+        // --- NEW: Empty State UI ---
+        <div className="text-center py-20 bg-white rounded-2xl border-2 border-dashed border-gray-200">
+          <div className="bg-gray-100 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4">
+            <Search size={32} className="text-gray-400" />
+          </div>
+          <h3 className="text-lg font-bold text-gray-900">No books found</h3>
+          <p className="text-gray-500 mb-6">Try adjusting your search or filters.</p>
+          <button 
+            onClick={() => {setSearch(''); fetchBooks('');}} 
+            className="text-blue-600 font-bold hover:underline"
+          >
+            Clear all filters
+          </button>
         </div>
       )}
 

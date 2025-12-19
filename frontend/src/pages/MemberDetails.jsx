@@ -13,7 +13,8 @@ export default function MemberDetails() {
   const [reservations, setReservations] = useState([]);
   const [fines, setFines] = useState([]);
   const [loading, setLoading] = useState(true);
-
+  const [payFineId, setPayFineId] = useState(null); // Which fine are we paying?
+  const [payAmount, setPayAmount] = useState('');
   // Fetch all data for this member
   const fetchData = async () => {
     try {
@@ -33,6 +34,19 @@ export default function MemberDetails() {
       navigate('/members'); // Go back if failed
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handlePayFine = async (e) => {
+    e.preventDefault();
+    try {
+      await api.post(`/fines/${payFineId}/pay`, { amount: parseFloat(payAmount) });
+      toast.success("Payment processed!");
+      setPayFineId(null);
+      setPayAmount('');
+      fetchData(); // Refresh list to show updated balance
+    } catch (error) {
+      toast.error(error.response?.data?.detail || "Payment failed");
     }
   };
 
@@ -202,13 +216,34 @@ export default function MemberDetails() {
                 </thead>
                 <tbody className="divide-y divide-gray-100">
                   {fines.map(fine => (
-                    <tr key={fine.id}>
-                      <td className="p-3">{fine.reason}</td>
-                      <td className="p-3">${fine.amount}</td>
+                    <tr key={fine.id} className="hover:bg-gray-50">
                       <td className="p-3">
-                        <span className={`text-xs px-2 py-1 rounded ${fine.status === 'Paid' ? 'bg-gray-100 text-gray-600' : 'bg-red-100 text-red-600'}`}>
+                        <div className="font-medium text-gray-800">{fine.reason}</div>
+                        <div className="text-[10px] text-gray-400">Loan #{fine.loan_id}</div>
+                      </td>
+                      <td className="p-3 font-mono text-sm">
+                        ${(fine.amount - fine.amount_paid).toFixed(2)}
+                      </td>
+                      <td className="p-3">
+                        <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold uppercase ${
+                          fine.status === 'Paid' ? 'bg-gray-100 text-gray-500' : 'bg-red-100 text-red-600'
+                        }`}>
                           {fine.status}
                         </span>
+                      </td>
+                      {/* NEW: Pay Action */}
+                      <td className="p-3 text-right">
+                        {fine.status !== 'Paid' && (
+                          <button 
+                            onClick={() => {
+                              setPayFineId(fine.id);
+                              setPayAmount((fine.amount - fine.amount_paid).toString()); // Default to full amount
+                            }}
+                            className="text-xs bg-green-600 text-white px-2 py-1 rounded hover:bg-green-700 transition shadow-sm"
+                          >
+                            Collect
+                          </button>
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -237,6 +272,42 @@ export default function MemberDetails() {
               </button>
             </div>
           </div>
+          {payFineId && (
+            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+              <div className="bg-white rounded-2xl shadow-2xl max-w-sm w-full p-8 border border-gray-100">
+                <h3 className="text-xl font-bold text-gray-900 mb-2">Record Payment</h3>
+                <p className="text-sm text-gray-500 mb-6">Enter the amount received from the member (Cash/Card).</p>
+                
+                <form onSubmit={handlePayFine} className="space-y-4">
+                  <div>
+                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1">Amount to Pay ($)</label>
+                    <input 
+                      required autoFocus step="0.01" type="number" 
+                      className="w-full text-2xl font-bold p-3 border-2 border-gray-200 rounded-xl focus:border-green-500 outline-none text-center"
+                      value={payAmount}
+                      onChange={e => setPayAmount(e.target.value)}
+                    />
+                  </div>
+                  
+                  <div className="flex gap-3 pt-4">
+                    <button 
+                      type="button" 
+                      onClick={() => setPayFineId(null)}
+                      className="flex-1 px-4 py-2 text-gray-500 font-medium hover:bg-gray-100 rounded-lg transition"
+                    >
+                      Cancel
+                    </button>
+                    <button 
+                      type="submit"
+                      className="flex-1 px-4 py-2 bg-green-600 text-white font-bold rounded-lg hover:bg-green-700 shadow-md transition"
+                    >
+                      Confirm
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>

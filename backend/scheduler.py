@@ -14,6 +14,7 @@ def run_daily_maintenance():
         # ==========================================
         # TASK 1: Expire Stale Reservations
         # ==========================================
+          # ... (Task 1: Reservation Expiry)
         expiry_limit = datetime.utcnow() - timedelta(days=HOLD_EXPIRY_DAYS)
         stale_reservations = db.query(models.Reservation).filter(
             models.Reservation.status == "Fulfilled",
@@ -22,12 +23,31 @@ def run_daily_maintenance():
         
         for res in stale_reservations:
             res.status = "Expired"
+            
+            # Find the item that was stuck in "Reserved"
             stuck_item = db.query(models.BookItem).filter(
                 models.BookItem.book_id == res.book_id,
                 models.BookItem.status == "Reserved"
             ).first()
+            
             if stuck_item:
-                stuck_item.status = "Available"
+                # --- NEW: SMART HANDOVER LOGIC ---
+                next_person = db.query(models.Reservation).filter(
+                    models.Reservation.book_id == res.book_id,
+                    models.Reservation.status == "Pending"
+                ).order_by(models.Reservation.reservation_date.asc()).first()
+                
+                if next_person:
+                    next_person.status = "Fulfilled"
+                    # Notify the next person
+                    msg = f"The book '{stuck_item.book.title}' is now ready for you! (The previous hold expired)."
+                    db.add(models.Notification(member_id=next_person.member_id, message=msg))
+                    # Item stays 'Reserved'
+                    print(f"♻️ Scheduler: Hold expired. Reassigned to Member {next_person.member_id}")
+                else:
+                    stuck_item.status = "Available"
+                    print(f"♻️ Scheduler: Hold expired. No one else waiting. Set to Available.")
+        
         
         # ==========================================
         # TASK 2: Calculate Daily Fines (FIXED)

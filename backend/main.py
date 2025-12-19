@@ -353,7 +353,17 @@ def reserve_book(request: schemas.ReservationCreate, db: Session = Depends(get_d
             detail=f"Reservation blocked: You have outstanding fines of ${total_debt}. Limit is ${MAX_FINE_THRESHOLD}."
         )
     # ------------------------------------------------------
+    already_borrowed = db.query(models.Loan).join(models.BookItem).filter(
+        models.Loan.member_id == request.member_id,
+        models.BookItem.book_id == request.book_id,
+        models.Loan.status == "Active"
+    ).first()
 
+    if already_borrowed:
+        raise HTTPException(
+            status_code=400, 
+            detail="You currently have a copy of this book. Return it before reserving again."
+        )
     # 2. Check Duplicate Reservation
     existing_res = db.query(models.Reservation).filter(
         models.Reservation.book_id == request.book_id,
@@ -444,34 +454,65 @@ def get_my_fines(
     ).all()
 
 @app.post("/api/fines/{fine_id}/pay")
-def pay_fine(fine_id: int, payment: schemas.FinePaymentRequest, db: Session = Depends(get_db)):
-    """CIRC-004: Partial or Full Fine Payment"""
+def pay_fine(
+    fine_id: int, 
+    payment: schemas.FinePaymentRequest, 
+    current_user: models.Librarian = Depends(get_current_user), # RBAC: Only staff can collect money
+    db: Session = Depends(get_db)
+):
+    """
+    CIRC-004: Collect Fines (Staff Only)
+    BUSINESS RULE: 
+    1. Only Librarians/Admins can process payments.
+    2. A fine cannot be paid if the associated book is still 'Active' (not returned).
+    3. Supports partial payments.
+    """
+    # 1. Staff Check
+    if current_user.role not in ["Librarian", "Admin"]:
+        raise HTTPException(status_code=403, detail="Only staff members can process fine payments.")
+
+    # 2. Find Fine
     fine = db.query(models.Fine).filter(models.Fine.id == fine_id).first()
     if not fine:
-        raise HTTPException(status_code=404, detail="Fine not found")
+        raise HTTPException(status_code=404, detail="Fine record not found")
     
-    remaining_balance = fine.amount - fine.amount_paid
-    
-    if fine.status == "Paid" or remaining_balance <= 0:
-        raise HTTPException(status_code=400, detail="Fine is already paid")
+    # 3. ENFORCE RULE: Book must be returned first
+    # This prevents users from paying today to "bypass" the debt block while still keeping the book.
+    if fine.loan.status == "Active":
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Payment Blocked: Book item {fine.loan.book_item_id} is still out. " 
+                   f"The book must be returned to the library before this fine can be settled."
+        )
 
+    # 4. Check if already paid
+    remaining_balance = fine.amount - fine.amount_paid
+    if fine.status == "Paid" or remaining_balance <= 0:
+        raise HTTPException(status_code=400, detail="This fine is already fully paid.")
+
+    # 5. Validate Amount
     if payment.amount <= 0:
-        raise HTTPException(status_code=400, detail="Payment amount must be positive")
+        raise HTTPException(status_code=400, detail="Payment amount must be greater than zero.")
         
     if payment.amount > remaining_balance:
-        raise HTTPException(status_code=400, detail=f"Payment exceeds balance. Remaining: ${remaining_balance}")
+        raise HTTPException(status_code=400, detail=f"Payment exceeds the remaining balance of ${remaining_balance:.2f}")
 
-    # Process Payment
+    # 6. Process Payment
     fine.amount_paid += payment.amount
     
-    # Update Status
+    # 7. Update Status
     if fine.amount_paid >= fine.amount:
         fine.status = "Paid"
     else:
         fine.status = "Partial"
 
     db.commit()
-    return {"message": "Payment recorded", "remaining_balance": fine.amount - fine.amount_paid, "status": fine.status}
+    return {
+        "message": "Payment recorded successfully",
+        "paid_now": payment.amount,
+        "remaining_balance": fine.amount - fine.amount_paid,
+        "new_status": fine.status
+    }
 
 @app.get("/api/recommendations", response_model=list[schemas.BookResponse])
 def get_recommendations(member_id: int, db: Session = Depends(get_db)):
@@ -1314,6 +1355,44 @@ def delete_member(
     db.delete(member)
     db.commit()
     return {"message": "Member record removed"}
+
+@app.delete("/api/admin/librarians/{lib_id}")
+def delete_librarian(
+    lib_id: int,
+    current_user: models.Librarian = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if current_user.role != "Admin":
+        raise HTTPException(status_code=403, detail="Only admins can remove staff")
+
+    staff = db.query(models.Librarian).filter(models.Librarian.id == lib_id).first()
+    if not staff:
+        raise HTTPException(status_code=404, detail="Staff member not found")
+        
+    if staff.id == current_user.id:
+        raise HTTPException(status_code=400, detail="You cannot delete your own admin account")
+
+    db.delete(staff)
+    db.commit()
+    return {"message": "Staff account removed"}
+
+@app.get("/api/books/popular", response_model=list[schemas.BookResponse])
+def get_top_popular_books(db: Session = Depends(get_db)):
+    """Fetch Top 5 most borrowed books across the whole library"""
+    # Use the helper function we wrote in recommendation.py
+    popular_ids = recommendation.get_popular_books(db, limit=5)
+    
+    if not popular_ids:
+        # If no loans exist yet, just return the 5 newest books
+        return db.query(models.Book).order_by(models.Book.id.desc()).limit(5).all()
+        
+    books = db.query(models.Book).filter(models.Book.id.in_(popular_ids)).all()
+    
+    # Calculate available copies for the badges
+    for book in books:
+        book.available_copies = len([item for item in book.items if item.status == 'Available'])
+        
+    return books
 
 # --- Static File Serving (Keep this at the end) ---
 if os.path.exists("static_ui"):
