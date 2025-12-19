@@ -13,6 +13,8 @@ import Reports from './pages/Reports';
 import Profile from './pages/Profile';
 import AdminStaff from './pages/AdminStaff';
 import MemberDetails from './pages/MemberDetails';
+import BookDetail from './pages/BookDetail';
+import ManageBook from './pages/ManageBook';
 
 const ProtectedRoute = ({ children }) => {
   const { user } = useAuth();
@@ -35,6 +37,8 @@ function App() {
             <Route path="/dashboard" element={<Dashboard />} />
             
             <Route path="/books" element={<BookCatalog />} />
+            <Route path="/books/:id" element={<BookDetail />} />
+            <Route path="/books/:id/manage" element={<ManageBook />} />
             <Route path="/profile" element={<Profile />} />
             
             {/* Member Routes */}

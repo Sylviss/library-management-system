@@ -588,36 +588,35 @@ def renew_book(
     current_user: models.Member = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    PORT-006: Renew Book Loan
-    Logic:
-    1. Check ownership & status.
-    2. Check Renewal Limit (Max 2).
-    3. Check Reservations.
-    4. Extend Date & Increment Count.
-    """
+    """PORT-006: Renew Book Loan"""
     loan = db.query(models.Loan).filter(models.Loan.id == loan_id).first()
     
-    # 1. Basic Validation
+    # 1. Basic Validation (Not Found, Auth, Inactive)
     if not loan:
         raise HTTPException(status_code=404, detail="Loan not found")
-    # Allow if owner OR if staff
+        
+    # Permission Check (Owner or Staff)
     is_owner = loan.member_id == current_user.id
     is_staff = getattr(current_user, "role", None) in ["Librarian", "Admin"]
-    
     if not (is_owner or is_staff):
         raise HTTPException(status_code=403, detail="Not authorized")
+
     if loan.status != "Active":
         raise HTTPException(status_code=400, detail="Cannot renew inactive loan")
 
-    # 2. Check Renewal Limit (New Rule)
-    if loan.renewal_count >= 2:
+    # --- NEW: Check if Overdue ---
+    if loan.due_date < date.today():
         raise HTTPException(
             status_code=400, 
-            detail="Maximum renewal limit (2) reached for this loan."
+            detail="Cannot renew overdue items. Please return the book."
         )
+    # -----------------------------
 
-    # 3. Check for Reservations (No Camping Rule)
+    # 2. Check Renewal Limit
+    if loan.renewal_count >= MAX_RENEWALS:
+        raise HTTPException(status_code=400, detail="Maximum renewal limit reached.")
+
+    # 3. Check Reservations (No Camping)
     book_id = loan.book_item.book_id
     pending_reservations = db.query(models.Reservation).filter(
         models.Reservation.book_id == book_id,
@@ -625,21 +624,14 @@ def renew_book(
     ).count()
 
     if pending_reservations > 0:
-        raise HTTPException(
-            status_code=400, 
-            detail="Cannot renew: This book is reserved by another member."
-        )
+        raise HTTPException(status_code=400, detail="Cannot renew: Reserved by another member.")
 
-    # 4. Success: Extend Date & Increment Count
-    loan.due_date = loan.due_date + timedelta(days=14)
+    # 4. Success
+    loan.due_date = loan.due_date + timedelta(days=LOAN_PERIOD_DAYS)
     loan.renewal_count += 1
     db.commit()
     
-    return {
-        "message": "Loan renewed successfully", 
-        "new_due_date": loan.due_date,
-        "renewal_count": loan.renewal_count
-    }
+    return {"message": "Loan renewed successfully", "new_due_date": loan.due_date, "renewal_count": loan.renewal_count}
 
 @app.get("/api/my/profile", response_model=schemas.MemberResponse)
 def get_my_profile(current_user: models.Member = Depends(get_current_user)):
@@ -1064,6 +1056,31 @@ def get_member_fines_staff(
     return db.query(models.Fine).filter(
         models.Fine.member_id == member_id
     ).all()
+
+@app.get("/api/books/{book_id}", response_model=schemas.BookResponse)
+def get_book_details(book_id: int, db: Session = Depends(get_db)):
+    """Get detailed info for a single book"""
+    book = db.query(models.Book).filter(models.Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    
+    # Compute available copies on the fly
+    book.available_copies = len([item for item in book.items if item.status == 'Available'])
+    return book
+
+@app.get("/api/books/{book_id}/items", response_model=list[schemas.BookItemResponse])
+def get_book_items_list(
+    book_id: int, 
+    current_user: models.Librarian = Depends(get_current_user), # Staff only
+    db: Session = Depends(get_db)
+):
+    """List all physical copies of a specific book"""
+    # Verify book exists
+    book = db.query(models.Book).filter(models.Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+        
+    return db.query(models.BookItem).filter(models.BookItem.book_id == book_id).all()
 
 # --- Static File Serving (Keep this at the end) ---
 if os.path.exists("static_ui"):
