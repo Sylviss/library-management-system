@@ -386,17 +386,48 @@ def reserve_book(request: schemas.ReservationCreate, db: Session = Depends(get_d
 
 @app.post("/api/reservations/{reservation_id}/cancel")
 def cancel_reservation(reservation_id: int, db: Session = Depends(get_db)):
-    """RES-002: Cancel Reservation"""
+    # 1. Find the reservation to be canceled
     reservation = db.query(models.Reservation).filter(models.Reservation.id == reservation_id).first()
     if not reservation:
         raise HTTPException(status_code=404, detail="Reservation not found")
     
-    if reservation.status != "Pending":
-         raise HTTPException(status_code=400, detail="Cannot cancel a completed or already canceled reservation")
+    # 2. Check if this reservation was already "Fulfilled" (Book is waiting on shelf)
+    if reservation.status == "Fulfilled":
+        # A. Find the physical copy that was held for this book title
+        stuck_item = db.query(models.BookItem).filter(
+            models.BookItem.book_id == reservation.book_id,
+            models.BookItem.status == "Reserved"
+        ).first()
 
+        if stuck_item:
+            # B. Look for the NEXT person in line (The person with the oldest 'Pending' reservation)
+            next_in_line = db.query(models.Reservation).filter(
+                models.Reservation.book_id == reservation.book_id,
+                models.Reservation.status == "Pending"
+            ).order_by(models.Reservation.reservation_date.asc()).first()
+
+            if next_in_line:
+                # --- HANDOVER LOGIC ---
+                # 1. Keep the item status as "Reserved"
+                # 2. Move the next person to "Fulfilled"
+                next_in_line.status = "Fulfilled"
+                
+                # 3. Notify the new lucky person
+                msg = f"Good news! The book '{stuck_item.book.title}' is now available for pickup because someone ahead of you canceled."
+                notification = models.Notification(member_id=next_in_line.member_id, message=msg)
+                db.add(notification)
+                
+                print(f"♻️ Handover: Hold for {reservation.member_id} canceled. Book assigned to next in line: Member {next_in_line.member_id}")
+            else:
+                # No one else is waiting -> Make it available for the public
+                stuck_item.status = "Available"
+                print(f"♻️ Released: No one else in line for {stuck_item.barcode}. Setting to Available.")
+
+    # 3. Finalize cancellation of the current user
     reservation.status = "Canceled"
     db.commit()
-    return {"message": "Reservation canceled successfully"}
+    
+    return {"message": "Reservation canceled. Queue updated and item reassigned if necessary."}
 
 
 # --- Fine Management Endpoints ---
@@ -546,23 +577,27 @@ def get_my_loan_history(
     
     return {"active_loans": active, "past_loans": past}
 
-@app.put("/api/my/profile", response_model=schemas.MemberResponse)
+@app.put("/api/my/profile")
 def update_my_profile(
     profile_data: schemas.ProfileUpdate,
-    current_user: models.Member = Depends(get_current_user),
+    current_user: Union[models.Member, models.Librarian] = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """PORT-003: Update Personal Information"""
+    """Works for BOTH Librarians and Members"""
+    # 1. Update common fields
     if profile_data.full_name:
         current_user.full_name = profile_data.full_name
-    if profile_data.phone_number:
-        current_user.phone_number = profile_data.phone_number
-    if profile_data.address:
-        current_user.address = profile_data.address
-    
+        
+    # 2. Update Member-only fields
+    if hasattr(current_user, 'phone_number'): # Only members have these
+        if profile_data.phone_number:
+            current_user.phone_number = profile_data.phone_number
+        if profile_data.address:
+            current_user.address = profile_data.address
+            
     db.commit()
     db.refresh(current_user)
-    return current_user
+    return {"message": "Profile updated", "full_name": current_user.full_name}
 
 @app.post("/api/my/password")
 def change_my_password(
@@ -604,6 +639,11 @@ def renew_book(
     if loan.status != "Active":
         raise HTTPException(status_code=400, detail="Cannot renew inactive loan")
 
+    # If a Member is trying to renew, check if they are Blocked
+    if not hasattr(current_user, 'role'): # It's a Member
+        if current_user.status != "Active":
+            raise HTTPException(status_code=400, detail="Your account is blocked. Please contact the library.")
+    
     # --- NEW: Check if Overdue ---
     if loan.due_date < date.today():
         raise HTTPException(
@@ -793,18 +833,20 @@ def delete_book_item(
     current_user: models.Librarian = Depends(get_current_user), 
     db: Session = Depends(get_db)
 ):
-    """BIM-005: Remove Book Item"""
     item = db.query(models.BookItem).filter(models.BookItem.barcode == barcode).first()
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
     
-    # Check Constraint: Cannot delete if currently borrowed
-    if item.status == "Borrowed":
-        raise HTTPException(status_code=400, detail="Cannot remove item that is currently on loan.")
+    # CRITICAL CHECK: Block if the book is physically with a member
+    if item.status in ["Borrowed", "Reserved"]:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Cannot remove item. It is currently {item.status}. Return the item first."
+        )
         
     db.delete(item)
     db.commit()
-    return {"message": "Item removed successfully"}
+    return {"message": "Physical item removed"}
 
 @app.get("/api/reports/stats", response_model=schemas.DashboardStats)
 def get_dashboard_stats(
@@ -976,30 +1018,44 @@ def get_my_reservations(
     current_user: models.Member = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """List all active reservations with Queue Position"""
+    """
+    PORT-001/002: View My active reservations.
+    Includes Book Titles and Queue Positions.
+    """
+    # 1. Fetch active reservations for the current member
     reservations = db.query(models.Reservation).filter(
         models.Reservation.member_id == current_user.id,
         models.Reservation.status.in_(["Pending", "Fulfilled"])
     ).all()
     
-    # Calculate Queue Position for Pending items
+    output = []
+    
     for res in reservations:
+        # Convert DB object to Pydantic model
+        item = schemas.ReservationResponse.from_orm(res)
+        
+        # QoL Fix: Inject the Book Title so the user knows what they reserved
+        item.book_title = res.book.title 
+
+        # Logic: Calculate Queue Position for "Pending" items
         if res.status == "Pending":
-            # Logic: Count how many Pending reservations for this book 
-            # were created BEFORE this one.
-            position = db.query(models.Reservation).filter(
+            # Count how many other 'Pending' reservations for this book 
+            # were created BEFORE this one (strictly older timestamp)
+            earlier_reservations_count = db.query(models.Reservation).filter(
                 models.Reservation.book_id == res.book_id,
                 models.Reservation.status == "Pending",
                 models.Reservation.reservation_date < res.reservation_date
             ).count()
             
-            # Position 0 means you are 1st in line. So we add 1.
-            res.queue_position = position + 1
+            # Position 0 in query means you are 1st in line
+            item.queue_position = earlier_reservations_count + 1
         else:
-            # If Fulfilled, you aren't in line, you are waiting for pickup
-            res.queue_position = 0 
+            # If status is 'Fulfilled', they are at the front of the line (Pickup ready)
+            item.queue_position = 0 
 
-    return reservations
+        output.append(item)
+        
+    return output
 
 @app.get("/api/admin/librarians", response_model=list[schemas.LibrarianResponse])
 def list_librarians(
@@ -1081,6 +1137,183 @@ def get_book_items_list(
         raise HTTPException(status_code=404, detail="Book not found")
         
     return db.query(models.BookItem).filter(models.BookItem.book_id == book_id).all()
+
+@app.get("/api/items/{barcode}/details", response_model=schemas.BookItemDetail)
+def get_item_details(
+    barcode: str,
+    current_user: models.Librarian = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    item = db.query(models.BookItem).filter(models.BookItem.barcode == barcode).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item barcode not found")
+    
+    response = {
+        "barcode": item.barcode,
+        "status": item.status,
+        "book_title": item.book.title,
+        "book_author": item.book.author,
+        "book_cover": item.book.cover_image_url,
+        "reserved_for": [],
+        "current_borrower_id": None,
+        "current_borrower_name": None,
+        "due_date": None
+    }
+    
+    # Logic 1: If Reserved, who is waiting?
+    if item.status == "Reserved":
+        candidates = db.query(models.Reservation).filter(
+            models.Reservation.book_id == item.book_id,
+            models.Reservation.status == "Fulfilled"
+        ).all()
+        response["reserved_for"] = [f"{res.member.full_name} (ID: {res.member_id})" for res in candidates]
+
+    # Logic 2: If Borrowed, who has it? (Auto-fill support)
+    if item.status == "Borrowed" or item.status == "Overdue": # "Overdue" isn't a status in DB (it's calc), but checking Borrowed covers it
+        active_loan = db.query(models.Loan).filter(
+            models.Loan.book_item_id == item.barcode,
+            models.Loan.status == "Active"
+        ).first()
+        
+        if active_loan:
+            response["current_borrower_id"] = active_loan.member_id
+            response["current_borrower_name"] = active_loan.member.full_name
+            response["due_date"] = active_loan.due_date
+
+    return response
+    
+@app.get("/api/admin/reservations/search", response_model=list[schemas.ReservationResponse])
+def search_all_reservations(
+    q: str = "",
+    current_user: models.Librarian = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if current_user.role not in ["Librarian", "Admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    query = db.query(models.Reservation).join(models.Member).join(models.Book)
+    
+    if q:
+        search = f"%{q}%"
+        query = query.filter(
+            (models.Member.full_name.ilike(search)) |
+            (models.Book.title.ilike(search))
+        )
+    
+    results = query.order_by(models.Reservation.status.desc(), models.Reservation.reservation_date.desc()).all()
+    
+    output = []
+    for r in results:
+        item = schemas.ReservationResponse.from_orm(r)
+        item.member_name = r.member.full_name
+        item.book_title = r.book.title
+        
+        # --- NEW: Calculate Position for Staff View ---
+        if r.status == "Pending":
+            pos = db.query(models.Reservation).filter(
+                models.Reservation.book_id == r.book_id,
+                models.Reservation.status == "Pending",
+                models.Reservation.reservation_date < r.reservation_date
+            ).count()
+            item.queue_position = pos + 1
+        else:
+            item.queue_position = 0
+            
+        output.append(item)
+        
+    return output
+
+@app.patch("/api/my/notifications/{notif_id}/read")
+def mark_notification_read(
+    notif_id: int, 
+    current_user: Union[models.Member, models.Librarian] = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
+    notif = db.query(models.Notification).filter(
+        models.Notification.id == notif_id,
+        models.Notification.member_id == current_user.id # Security check
+    ).first()
+    if not notif:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    notif.is_read = True
+    db.commit()
+    return {"message": "Marked as read"}
+
+@app.delete("/api/books/{book_id}")
+def delete_book(
+    book_id: int, 
+    current_user: models.Librarian = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """BIM-005: Delete the entire Book record (Title + metadata)"""
+    if current_user.role not in ["Librarian", "Admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    book = db.query(models.Book).filter(models.Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    # 1. Check for physical items
+    items_count = db.query(models.BookItem).filter(models.BookItem.book_id == book_id).count()
+    if items_count > 0:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Cannot delete book. There are still {items_count} physical items in inventory. Delete items first."
+        )
+
+    # 2. Check for active reservations
+    res_count = db.query(models.Reservation).filter(
+        models.Reservation.book_id == book_id,
+        models.Reservation.status.in_(["Pending", "Fulfilled"])
+    ).count()
+    if res_count > 0:
+        raise HTTPException(
+            status_code=400, 
+            detail="Cannot delete book. There are active reservations/waitlists for this title."
+        )
+
+    db.delete(book)
+    db.commit()
+    return {"message": "Book title removed from catalog"}
+
+@app.post("/api/my/notifications/read-all")
+def mark_all_notifications_read(
+    current_user: Union[models.Member, models.Librarian] = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """QoL: Clear all alerts for the user"""
+    db.query(models.Notification).filter(
+        models.Notification.member_id == current_user.id,
+        models.Notification.is_read == False
+    ).update({"is_read": True})
+    db.commit()
+    return {"message": "All caught up!"}
+
+@app.delete("/api/members/{member_id}")
+def delete_member(
+    member_id: int,
+    current_user: models.Librarian = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Safety: Prevent deleting members with outstanding obligations"""
+    if current_user.role != "Admin":
+        raise HTTPException(status_code=403, detail="Only admins can delete members")
+
+    member = db.query(models.Member).filter(models.Member.id == member_id).first()
+    
+    # 1. Check for Active Loans
+    active_loans = db.query(models.Loan).filter(models.Loan.member_id == member_id, models.Loan.status == "Active").count()
+    if active_loans > 0:
+        raise HTTPException(status_code=400, detail=f"Cannot delete. Member still has {active_loans} books.")
+
+    # 2. Check for Unpaid Fines
+    unpaid_fines = db.query(models.Fine).filter(models.Fine.member_id == member_id, models.Fine.status != "Paid").count()
+    if unpaid_fines > 0:
+        raise HTTPException(status_code=400, detail="Cannot delete. Member has unpaid fines.")
+
+    db.delete(member)
+    db.commit()
+    return {"message": "Member record removed"}
 
 # --- Static File Serving (Keep this at the end) ---
 if os.path.exists("static_ui"):

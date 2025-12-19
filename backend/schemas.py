@@ -92,6 +92,10 @@ class ReservationResponse(BaseModel):
     status: str
     queue_position: Optional[int] = None  # <--- NEW FIELD
 
+    # NEW FIELDS (computed)
+    member_name: Optional[str] = None
+    book_title: Optional[str] = None
+    
     class Config:
         from_attributes = True
 
@@ -208,3 +212,19 @@ class MemberActivityReportItem(BaseModel):
     total_loans: int
     active_loans_count: int
     total_fines_paid: float
+    
+class BookItemDetail(BaseModel):
+    barcode: str
+    status: str
+    book_title: str
+    book_author: str
+    book_cover: Optional[str] = None
+    reserved_for: Optional[List[str]] = [] 
+    
+    # NEW FIELDS
+    current_borrower_id: Optional[int] = None
+    current_borrower_name: Optional[str] = None
+    due_date: Optional[date] = None # Helpful for preview
+    
+    class Config:
+        from_attributes = True

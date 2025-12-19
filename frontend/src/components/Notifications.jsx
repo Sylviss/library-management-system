@@ -52,10 +52,17 @@ export default function Notifications() {
 
       {isOpen && (
         <div className="absolute right-0 mt-2 w-80 bg-white rounded-xl shadow-lg border border-gray-100 z-50 overflow-hidden">
-          <div className="p-4 border-b border-gray-100 bg-gray-50">
+          <div className="p-4 border-b border-gray-100 bg-gray-50 flex justify-between items-center">
             <h3 className="font-bold text-gray-700 text-sm">Notifications</h3>
+            {unreadCount > 0 && (
+              <button 
+                onClick={handleMarkAllRead} // Create this handler to call /read-all
+                className="text-xs text-blue-600 hover:underline font-medium"
+              >
+                Mark all as read
+              </button>
+            )}
           </div>
-          
           <div className="max-h-64 overflow-y-auto">
             {notifications.length === 0 ? (
               <div className="p-4 text-center text-gray-400 text-sm">
@@ -63,8 +70,16 @@ export default function Notifications() {
               </div>
             ) : (
               notifications.map((notif) => (
-                <div key={notif.id} className="p-4 border-b border-gray-50 hover:bg-gray-50 text-sm">
-                  <p className="text-gray-800">{notif.message}</p>
+                <div 
+                  key={notif.id} 
+                  onClick={() => handleMarkAsRead(notif.id)} // <--- NEW HANDLER
+                  className={`p-4 border-b border-gray-50 cursor-pointer transition ${
+                    notif.is_read ? 'bg-white opacity-60' : 'bg-blue-50 hover:bg-blue-100'
+                  }`}
+                >
+                  <p className={`text-sm ${notif.is_read ? 'text-gray-500' : 'font-semibold text-gray-800'}`}>
+                    {notif.message}
+                  </p>
                   <p className="text-xs text-gray-400 mt-1">
                     {new Date(notif.created_at).toLocaleDateString()}
                   </p>

@@ -9,7 +9,7 @@ export default function ManageBook() {
   const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState('details'); // 'details' or 'inventory'
   const [loading, setLoading] = useState(true);
-
+  
   // Data State
   const [book, setBook] = useState({});
   const [items, setItems] = useState([]);
@@ -37,6 +37,24 @@ export default function ManageBook() {
   useEffect(() => {
     loadData();
   }, [id]);
+
+  const handleDeleteBook = async () => {
+    const confirmFirst = window.confirm("DANGER: This will permanently remove this book title from the catalog. Continue?");
+    if (!confirmFirst) return;
+
+    const confirmSecond = window.confirm("Are you ABSOLUTELY sure? This action cannot be undone.");
+    if (!confirmSecond) return;
+
+    try {
+      await api.delete(`/books/${id}`);
+      toast.success("Book deleted from catalog");
+      navigate('/books'); // Redirect to catalog list
+    } catch (error) {
+      // This will catch the "Items still exist" error from backend
+      toast.error(error.response?.data?.detail || "Could not delete book");
+    }
+  };
+
 
   // --- Handlers: Edit Details ---
   const handleUpdateBook = async (e) => {
@@ -147,6 +165,24 @@ export default function ManageBook() {
             <button type="submit" className="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 flex items-center gap-2">
               <Save size={18} /> Save Changes
             </button>
+            {/* NEW: Danger Zone */}
+            <div className="mt-12 pt-8 border-t border-red-100">
+              <h3 className="text-red-600 font-bold flex items-center gap-2 mb-2">
+                <Trash2 size={18} /> Danger Zone
+              </h3>
+              <div className="bg-red-50 p-4 rounded-lg border border-red-100 flex justify-between items-center">
+                <div>
+                  <p className="text-red-800 font-medium">Delete this Book Title</p>
+                  <p className="text-red-600 text-xs">Once deleted, you cannot recover the metadata or history.</p>
+                </div>
+                <button 
+                  onClick={handleDeleteBook}
+                  className="bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700 font-bold text-sm shadow-sm"
+                >
+                  Delete Title
+                </button>
+              </div>
+            </div>
           </form>
         )}
 

@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import api from '../api';
 import toast from 'react-hot-toast';
-import { User, BookOpen, Clock, AlertCircle, ArrowLeft, RefreshCw } from 'lucide-react';
+import { User, BookOpen, Clock, AlertCircle, ArrowLeft, RefreshCw, Repeat, Trash2 } from 'lucide-react';
 
 export default function MemberDetails() {
   const { id } = useParams(); // Get Member ID from URL
@@ -61,6 +61,23 @@ export default function MemberDetails() {
       toast.error("Failed to cancel");
     }
   };
+  const handleDeleteMember = async () => {
+    // Double confirmation for safety
+    const confirmFirst = window.confirm(`DANGER: You are about to permanently delete ${member.full_name}. This will wipe their entire loan history. Continue?`);
+    if (!confirmFirst) return;
+
+    const confirmSecond = window.confirm("Are you ABSOLUTELY sure? This action is irreversible.");
+    if (!confirmSecond) return;
+
+    try {
+      await api.delete(`/members/${id}`);
+      toast.success("Member account deleted successfully");
+      navigate('/members'); // Redirect back to the member list
+    } catch (error) {
+      // This catches the backend "Safety Guard" error (e.g., if they still have books)
+      toast.error(error.response?.data?.detail || "Could not delete member");
+    }
+  };
 
   if (loading) return <div className="p-8 text-center">Loading member profile...</div>;
 
@@ -88,10 +105,16 @@ export default function MemberDetails() {
           </div>
         </div>
         <div className="text-right">
-           <div className="text-sm text-gray-500">Unpaid Fines</div>
-           <div className={`text-2xl font-bold ${fines.some(f => f.status === 'Unpaid') ? 'text-red-600' : 'text-gray-800'}`}>
-             ${fines.filter(f => f.status !== 'Paid').reduce((sum, f) => sum + (f.amount - f.amount_paid), 0).toFixed(2)}
-           </div>
+          <div className="text-sm text-gray-500">Unpaid Fines</div>
+          <div className={`text-2xl font-bold ${fines.some(f => f.status === 'Unpaid') ? 'text-red-600' : 'text-gray-800'}`}>
+            ${fines.filter(f => f.status !== 'Paid').reduce((sum, f) => sum + (f.amount - f.amount_paid), 0).toFixed(2)}
+          </div>
+          <button 
+            onClick={() => navigate('/circulation')}
+            className="flex items-center gap-2 bg-gray-800 text-white px-3 py-1.5 rounded-lg text-sm hover:bg-gray-900 transition"
+          >
+            <Repeat size={16} /> Go to Circulation Desk
+          </button>
         </div>
       </div>
 
@@ -193,7 +216,27 @@ export default function MemberDetails() {
               </table>
             </div>
           </div>
-
+            {/* --- NEW: Member Danger Zone --- */}
+          <div className="mt-12 pt-8 border-t border-red-100">
+            <h3 className="text-red-600 font-bold flex items-center gap-2 mb-4 uppercase tracking-wider text-sm">
+              <Trash2 size={18} /> Danger Zone
+            </h3>
+            <div className="bg-white p-6 rounded-xl border-2 border-red-50 flex flex-col md:flex-row justify-between items-center gap-4">
+              <div>
+                <p className="text-gray-900 font-bold">Permanently Delete Account</p>
+                <p className="text-gray-500 text-sm max-w-md">
+                  The user must have returned all books and paid all fines before deletion is possible. 
+                  All historical loan data for this user will be lost.
+                </p>
+              </div>
+              <button 
+                onClick={handleDeleteMember}
+                className="w-full md:w-auto bg-red-50 text-red-600 border border-red-200 px-6 py-2 rounded-lg hover:bg-red-600 hover:text-white font-bold transition-all shadow-sm"
+              >
+                Delete Member
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </div>
